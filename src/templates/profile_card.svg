@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="495" height="{{ card_height }}" viewBox="0 0 495 {{ card_height }}">
+  <style>
+    .header { font: 600 18px 'Segoe UI', sans-serif; fill: #2f80ed; }
+    .stat { font: 600 14px 'Segoe UI', sans-serif; fill: #333; }
+    .label { font: 400 14px 'Segoe UI', sans-serif; fill: #666; }
+    .lang-name { font: 400 12px 'Segoe UI', sans-serif; fill: #555; }
+    .lang-pct { font: 600 12px 'Segoe UI', sans-serif; fill: #333; }
+    .section { font: 600 14px 'Segoe UI', sans-serif; fill: #2f80ed; }
+  </style>
+  <rect width="494" height="{{ card_height - 1 }}" x="0.5" y="0.5" rx="4.5" fill="#fffefe" stroke="#e4e2e2"/>
+  <text x="25" y="35" class="header">{{ username }}'s Git Stats</text>
+  <text x="25" y="70" class="label">Total Commits:</text>
+  <text x="200" y="70" class="stat">{{ total_commits }}</text>
+  <text x="260" y="70" class="label">Public Repos:</text>
+  <text x="380" y="70" class="stat">{{ public_repos }}</text>
+  <text x="25" y="95" class="label">Lines Added:</text>
+  <text x="200" y="95" class="stat" fill="#28a745">+{{ total_additions }}</text>
+  <text x="260" y="95" class="label">Lines Deleted:</text>
+  <text x="380" y="95" class="stat" fill="#d73a49">-{{ total_deletions }}</text>
+
+  {% if languages | length > 0 %}
+  <line x1="25" y1="115" x2="470" y2="115" stroke="#e4e2e2" stroke-width="1"/>
+  <text x="25" y="135" class="section">Languages</text>
+
+  <rect x="25" y="145" width="445" height="8" rx="4" fill="#eee"/>
+  {% for lang in languages %}
+  <rect x="{{ lang.bar_x }}" y="145" width="{{ lang.bar_w }}" height="8" {% if loop.first %}rx="4"{% endif %} {% if loop.last %}rx="4"{% endif %} fill="{{ lang.color }}"/>
+  {% endfor %}
+
+  {% for lang in languages %}
+  <circle cx="{{ lang.dot_cx }}" cy="{{ lang.dot_cy }}" r="4" fill="{{ lang.color }}"/>
+  <text x="{{ lang.text_x }}" y="{{ lang.text_y }}" class="lang-name">{{ lang.name }}</text>
+  <text x="{{ lang.pct_x }}" y="{{ lang.text_y }}" class="lang-pct">{{ lang.pct }}%</text>
+  {% endfor %}
+  {% endif %}
+</svg>
