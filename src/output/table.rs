@@ -6,22 +6,40 @@ use std::path::PathBuf;
 use colored::Colorize;
 use comfy_table::{CellAlignment, ContentArrangement, Table};
 
-use crate::cli::{DedupMode, EmailDisplay, GroupBy, SortBy};
+use crate::cli::{DedupMode, EmailDisplay, GroupBy, NumberFormat, SortBy};
 use crate::stats::models::{GroupNode, PeriodStats};
 
 const LINE_WIDTH: usize = 81;
 const NAME_WIDTH: usize = 20;
 
-fn format_num(n: u64, short: bool) -> String {
-    if !short {
-        return n.to_string();
-    }
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+pub(crate) fn format_num(n: u64, num_fmt: NumberFormat) -> String {
+    match num_fmt {
+        NumberFormat::Plain => n.to_string(),
+        NumberFormat::Short => {
+            if n >= 1_000_000 {
+                format!("{:.1}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}k", n as f64 / 1_000.0)
+            } else {
+                n.to_string()
+            }
+        }
+        NumberFormat::Separated => {
+            let s = n.to_string();
+            let bytes = s.as_bytes();
+            let len = bytes.len();
+            if len <= 3 {
+                return s;
+            }
+            let mut result = String::with_capacity(len + (len - 1) / 3);
+            for (i, &b) in bytes.iter().enumerate() {
+                if i > 0 && (len - i) % 3 == 0 {
+                    result.push(',');
+                }
+                result.push(b as char);
+            }
+            result
+        }
     }
 }
 
@@ -31,14 +49,14 @@ fn format_num(n: u64, short: bool) -> String {
 fn format_co_aligned(
     val: u64,
     co_val: u64,
-    short: bool,
+    num_fmt: NumberFormat,
     main_w: usize,
     total_w: usize,
 ) -> String {
     let total = val + co_val;
-    let main = format!("{:>main_w$}", format_num(total, short));
+    let main = format!("{:>main_w$}", format_num(total, num_fmt));
     let suffix = if co_val > 0 {
-        format!(" ({})", format_num(co_val, short))
+        format!(" ({})", format_num(co_val, num_fmt))
     } else {
         String::new()
     };
@@ -123,15 +141,15 @@ fn col_widths_compact() -> (usize, usize) {
     (widths[0] + widths[1], widths[2])
 }
 
-fn max_change_widths(items: &[(u64, u64)], short: bool) -> (usize, usize) {
+fn max_change_widths(items: &[(u64, u64)], num_fmt: NumberFormat) -> (usize, usize) {
     let max_add = items
         .iter()
-        .map(|(a, _)| format!("+{}", format_num(*a, short)).len())
+        .map(|(a, _)| format!("+{}", format_num(*a, num_fmt)).len())
         .max()
         .unwrap_or(2);
     let max_del = items
         .iter()
-        .map(|(_, d)| format!("-{}", format_num(*d, short)).len())
+        .map(|(_, d)| format!("-{}", format_num(*d, num_fmt)).len())
         .max()
         .unwrap_or(2);
     (max_add, max_del)
@@ -141,13 +159,13 @@ fn format_changes_aligned(
     adds: u64,
     dels: u64,
     width: usize,
-    short: bool,
+    num_fmt: NumberFormat,
     bold: bool,
     add_w: usize,
     del_w: usize,
 ) -> String {
-    let add_s = format!("+{}", format_num(adds, short));
-    let del_s = format!("-{}", format_num(dels, short));
+    let add_s = format!("+{}", format_num(adds, num_fmt));
+    let del_s = format!("-{}", format_num(dels, num_fmt));
     let add_f = format!("{:>w$}", add_s, w = add_w);
     let del_f = format!("{:>w$}", del_s, w = del_w);
     let plain_len = add_w + 1 + del_w;
@@ -164,17 +182,17 @@ fn format_changes_aligned(
     }
 }
 
-fn max_inline_widths(items: &[(&str, u64, u64)], short: bool) -> (usize, usize, usize, usize) {
+fn max_inline_widths(items: &[(&str, u64, u64)], num_fmt: NumberFormat) -> (usize, usize, usize, usize) {
     let lang_w = items.iter().map(|(l, _, _)| l.len()).max().unwrap_or(1);
     let net_w = items.iter().map(|(_, a, d)| {
         let net = *a as i64 - *d as i64;
-        format_num(net.unsigned_abs(), short).len() + 1
+        format_num(net.unsigned_abs(), num_fmt).len() + 1
     }).max().unwrap_or(2);
     let add_w = items.iter().map(|(_, a, _)| {
-        format!("+{}", format_num(*a, short)).len()
+        format!("+{}", format_num(*a, num_fmt)).len()
     }).max().unwrap_or(2);
     let del_w = items.iter().map(|(_, _, d)| {
-        format!("-{}", format_num(*d, short)).len()
+        format!("-{}", format_num(*d, num_fmt)).len()
     }).max().unwrap_or(2);
     (lang_w, net_w, add_w, del_w)
 }
@@ -185,14 +203,14 @@ fn format_inline_entry(
     lang: &str,
     adds: u64,
     dels: u64,
-    short: bool,
+    num_fmt: NumberFormat,
     lang_w: usize,
     net_w: usize,
     add_w: usize,
     del_w: usize,
 ) -> String {
     let net = adds as i64 - dels as i64;
-    let net_s = format_num(net.unsigned_abs(), short);
+    let net_s = format_num(net.unsigned_abs(), num_fmt);
     let net_display = if net >= 0 { format!("+{net_s}") } else { format!("-{net_s}") };
     let net_aligned = format!("{:>w$}", net_display, w = net_w);
     let net_colored = if net >= 0 {
@@ -200,8 +218,8 @@ fn format_inline_entry(
     } else {
         net_aligned.red().to_string()
     };
-    let add_s = format!("+{}", format_num(adds, short));
-    let del_s = format!("-{}", format_num(dels, short));
+    let add_s = format!("+{}", format_num(adds, num_fmt));
+    let del_s = format!("-{}", format_num(dels, num_fmt));
     let add_aligned = format!("{:>w$}", add_s, w = add_w);
     let del_aligned = format!("{:>w$}", del_s, w = del_w);
     let lang_padded = format!("{:<w$}", lang, w = lang_w);
@@ -385,7 +403,7 @@ fn render_language_table(
     stats: &[PeriodStats],
     totals: &PeriodStats,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
 ) -> String {
     let mut out = String::new();
@@ -397,26 +415,26 @@ fn render_language_table(
         let change_items: Vec<(u64, u64)> = langs.iter().map(|(_, a, d, _)| (*a, *d))
             .chain(std::iter::once((totals.total_additions, totals.total_deletions)))
             .collect();
-        let (add_w, del_w) = max_change_widths(&change_items, short);
+        let (add_w, del_w) = max_change_widths(&change_items, num_fmt);
         let _ = writeln!(out, " {:<name_w$}{:>cw$}{:>fw$}",
             "Language".bold(), "Changes".bold(), "Files".bold(),
             name_w = NAME_WIDTH, cw = change_w, fw = file_w);
         let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
 
         for (lang, a, d, f) in &langs {
-            let fs = format!("{:>w$}", format_num(*f, short), w = file_w);
+            let fs = format!("{:>w$}", format_num(*f, num_fmt), w = file_w);
             let _ = writeln!(out, " {:<nw$}{}{}",
                 lang.cyan(),
-                format_changes_aligned(*a, *d, change_w, short, false, add_w, del_w),
+                format_changes_aligned(*a, *d, change_w, num_fmt, false, add_w, del_w),
                 fs.yellow(),
                 nw = NAME_WIDTH);
         }
 
         let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
-        let fs = format!("{:>w$}", format_num(total_files, short), w = file_w);
+        let fs = format!("{:>w$}", format_num(total_files, num_fmt), w = file_w);
         let _ = writeln!(out, " {:<nw$}{}{}",
             "Total".bold(),
-            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true, add_w, del_w),
+            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, num_fmt, true, add_w, del_w),
             fs.bold(),
             nw = NAME_WIDTH);
     } else {
@@ -427,7 +445,7 @@ fn render_language_table(
         for (lang, a, d, f) in &langs {
             let _ = writeln!(out, "{}", format_row_3_colored(
                 lang,
-                [&format_num(*a, short), &format_num(*d, short), &format_num(*f, short)],
+                [&format_num(*a, num_fmt), &format_num(*d, num_fmt), &format_num(*f, num_fmt)],
                 0, true,
             ));
         }
@@ -435,7 +453,7 @@ fn render_language_table(
         let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
         let _ = writeln!(out, "{}", format_row_3_colored(
             "Total",
-            [&format_num(totals.total_additions, short), &format_num(totals.total_deletions, short), &format_num(total_files, short)],
+            [&format_num(totals.total_additions, num_fmt), &format_num(totals.total_deletions, num_fmt), &format_num(total_files, num_fmt)],
             0, false,
         ).bold());
     }
@@ -475,7 +493,7 @@ fn render_author_table(
     dedup: &DedupMode,
     identity_map: &HashMap<String, String>,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
     inline_tree: bool,
 ) -> String {
@@ -500,20 +518,20 @@ fn render_author_table(
     // Pre-compute max main-number width per column so `(` aligns across rows
     let max_commit_main = authors
         .iter()
-        .map(|r| format_num(r.total_commits(), short).len())
-        .chain(std::iter::once(format_num(totals.total_commits, short).len()))
+        .map(|r| format_num(r.total_commits(), num_fmt).len())
+        .chain(std::iter::once(format_num(totals.total_commits, num_fmt).len()))
         .max()
         .unwrap_or(1);
     let max_add_main = authors
         .iter()
-        .map(|r| format_num(r.total_additions(), short).len())
-        .chain(std::iter::once(format_num(totals.total_additions, short).len()))
+        .map(|r| format_num(r.total_additions(), num_fmt).len())
+        .chain(std::iter::once(format_num(totals.total_additions, num_fmt).len()))
         .max()
         .unwrap_or(1);
     let max_del_main = authors
         .iter()
-        .map(|r| format_num(r.total_deletions(), short).len())
-        .chain(std::iter::once(format_num(totals.total_deletions, short).len()))
+        .map(|r| format_num(r.total_deletions(), num_fmt).len())
+        .chain(std::iter::once(format_num(totals.total_deletions, num_fmt).len()))
         .max()
         .unwrap_or(1);
 
@@ -524,13 +542,13 @@ fn render_author_table(
         })
         .chain(std::iter::once((totals.total_additions, totals.total_deletions)))
         .collect();
-    let (chg_add_w, chg_del_w) = max_change_widths(&change_items, short);
+    let (chg_add_w, chg_del_w) = max_change_widths(&change_items, num_fmt);
 
     let (il_lang_w, il_net_w, il_add_w, il_del_w) = if inline_tree {
         let items: Vec<(&str, u64, u64)> = authors.iter()
             .flat_map(|r| r.languages.iter().map(|(lang, a, d, _)| (lang.as_str(), *a, *d)))
             .collect();
-        max_inline_widths(&items, short)
+        max_inline_widths(&items, num_fmt)
     } else {
         (0, 0, 0, 0)
     };
@@ -552,7 +570,7 @@ fn render_author_table(
 
     for row in &authors {
         let display_name = format_author_display(row, email);
-        let c = format_co_aligned(row.commits, row.co_authored_commits, short, max_commit_main, num_w);
+        let c = format_co_aligned(row.commits, row.co_authored_commits, num_fmt, max_commit_main, num_w);
 
         if compact {
             let total_adds = row.additions + row.co_authored_additions;
@@ -562,12 +580,12 @@ fn render_author_table(
                 " {:<name_w$}{}{}{:>num_w$}",
                 display_name.bright_white(),
                 c.bright_cyan(),
-                format_changes_aligned(total_adds, total_dels, change_w, short, false, chg_add_w, chg_del_w),
+                format_changes_aligned(total_adds, total_dels, change_w, num_fmt, false, chg_add_w, chg_del_w),
                 row.top_lang.yellow(),
             );
         } else {
-            let a = format_co_aligned(row.additions, row.co_authored_additions, short, max_add_main, num_w);
-            let d = format_co_aligned(row.deletions, row.co_authored_deletions, short, max_del_main, num_w);
+            let a = format_co_aligned(row.additions, row.co_authored_additions, num_fmt, max_add_main, num_w);
+            let d = format_co_aligned(row.deletions, row.co_authored_deletions, num_fmt, max_del_main, num_w);
             let _ = writeln!(
                 out,
                 " {:<name_w$}{}{}{}{:>num_w$}",
@@ -585,7 +603,7 @@ fn render_author_table(
                 let pad = " ".repeat(offset);
                 for (i, (lang, la, ld, _lf)) in row.languages.iter().enumerate() {
                     let prefix = if i == row.languages.len() - 1 { "└── " } else { "├── " };
-                    let entry = format_inline_entry(prefix, lang, *la, *ld, short, il_lang_w, il_net_w, il_add_w, il_del_w);
+                    let entry = format_inline_entry(prefix, lang, *la, *ld, num_fmt, il_lang_w, il_net_w, il_add_w, il_del_w);
                     let _ = writeln!(out, "{}{}", pad, entry);
                 }
             } else if compact {
@@ -596,15 +614,15 @@ fn render_author_table(
                         " {:<name_w$}{:>num_w$}{}{:>num_w$}",
                         format!("{prefix}{lang}").dimmed(),
                         "",
-                        format_changes_aligned(*la, *ld, change_w, short, false, chg_add_w, chg_del_w),
+                        format_changes_aligned(*la, *ld, change_w, num_fmt, false, chg_add_w, chg_del_w),
                         "",
                     );
                 }
             } else {
                 for (i, (lang, la, ld, _lf)) in row.languages.iter().enumerate() {
                     let prefix = if i == row.languages.len() - 1 { "└── " } else { "├── " };
-                    let la_s = format_num(*la, short);
-                    let ld_s = format_num(*ld, short);
+                    let la_s = format_num(*la, num_fmt);
+                    let ld_s = format_num(*ld, num_fmt);
                     let _ = writeln!(
                         out,
                         " {:<name_w$}{:>num_w$}{:>num_w$}{:>num_w$}{:>num_w$}",
@@ -625,8 +643,8 @@ fn render_author_table(
             out,
             " {:<name_w$}{}{}{:>num_w$}",
             "Total".bold(),
-            format_co_aligned(totals.total_commits, 0, short, max_commit_main, num_w).bold(),
-            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true, chg_add_w, chg_del_w),
+            format_co_aligned(totals.total_commits, 0, num_fmt, max_commit_main, num_w).bold(),
+            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, num_fmt, true, chg_add_w, chg_del_w),
             "",
         );
     } else {
@@ -634,9 +652,9 @@ fn render_author_table(
             out,
             " {:<name_w$}{}{}{}{:>num_w$}",
             "Total".bold(),
-            format_co_aligned(totals.total_commits, 0, short, max_commit_main, num_w).bold(),
-            format_co_aligned(totals.total_additions, 0, short, max_add_main, num_w).bold(),
-            format_co_aligned(totals.total_deletions, 0, short, max_del_main, num_w).bold(),
+            format_co_aligned(totals.total_commits, 0, num_fmt, max_commit_main, num_w).bold(),
+            format_co_aligned(totals.total_additions, 0, num_fmt, max_add_main, num_w).bold(),
+            format_co_aligned(totals.total_deletions, 0, num_fmt, max_del_main, num_w).bold(),
             "",
         );
     }
@@ -647,7 +665,7 @@ fn render_period_table(
     stats: &[PeriodStats],
     _totals: &PeriodStats,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
     inline_tree: bool,
 ) -> String {
@@ -658,14 +676,14 @@ fn render_period_table(
         .flat_map(|p| p.by_language.values().map(|ls| (ls.additions, ls.deletions)))
         .chain(total_langs.iter().map(|(_, a, d, _)| (*a, *d)))
         .collect();
-    let (period_add_w, period_del_w) = max_change_widths(&change_items, short);
+    let (period_add_w, period_del_w) = max_change_widths(&change_items, num_fmt);
 
     let (il_lang_w, il_net_w, il_add_w, il_del_w) = if inline_tree {
         let items: Vec<(&str, u64, u64)> = stats.iter()
             .flat_map(|p| p.by_language.iter().map(|(lang, ls)| (lang.as_str(), ls.additions, ls.deletions)))
             .chain(total_langs.iter().map(|(lang, a, d, _)| (lang.as_str(), *a, *d)))
             .collect();
-        max_inline_widths(&items, short)
+        max_inline_widths(&items, num_fmt)
     } else {
         (0, 0, 0, 0)
     };
@@ -700,17 +718,17 @@ fn render_period_table(
             let pad = " ".repeat(NAME_WIDTH + 1);
             for (i, (lang, ls)) in langs.iter().enumerate() {
                 let prefix = if i == langs.len() - 1 { "└── " } else { "├── " };
-                let entry = format_inline_entry(prefix, lang, ls.additions, ls.deletions, short, il_lang_w, il_net_w, il_add_w, il_del_w);
+                let entry = format_inline_entry(prefix, lang, ls.additions, ls.deletions, num_fmt, il_lang_w, il_net_w, il_add_w, il_del_w);
                 let _ = writeln!(out, "{}{}", pad, entry);
             }
         } else if compact {
             let (change_w, file_w) = col_widths_compact();
             for (i, (lang, ls)) in langs.iter().enumerate() {
                 let prefix = if i == langs.len() - 1 { "└── " } else { "├── " };
-                let fs = format!("{:>w$}", format_num(ls.files_changed, short), w = file_w);
+                let fs = format!("{:>w$}", format_num(ls.files_changed, num_fmt), w = file_w);
                 let _ = writeln!(out, " {:<nw$}{}{}",
                     format!("{prefix}{lang}").cyan(),
-                    format_changes_aligned(ls.additions, ls.deletions, change_w, short, false, period_add_w, period_del_w),
+                    format_changes_aligned(ls.additions, ls.deletions, change_w, num_fmt, false, period_add_w, period_del_w),
                     fs.yellow(),
                     nw = NAME_WIDTH);
             }
@@ -719,7 +737,7 @@ fn render_period_table(
                 let prefix = if i == langs.len() - 1 { "└── " } else { "├── " };
                 let _ = writeln!(out, "{}", format_row_3_colored(
                     &format!("{prefix}{lang}"),
-                    [&format_num(ls.additions, short), &format_num(ls.deletions, short), &format_num(ls.files_changed, short)],
+                    [&format_num(ls.additions, num_fmt), &format_num(ls.deletions, num_fmt), &format_num(ls.files_changed, num_fmt)],
                     0, true,
                 ));
             }
@@ -737,17 +755,17 @@ fn render_period_table(
         let pad = " ".repeat(NAME_WIDTH + 1);
         for (i, (lang, a, d, _f)) in total_langs.iter().enumerate() {
             let prefix = if i == total_langs.len() - 1 { "└── " } else { "├── " };
-            let entry = format_inline_entry(prefix, lang, *a, *d, short, il_lang_w, il_net_w, il_add_w, il_del_w);
+            let entry = format_inline_entry(prefix, lang, *a, *d, num_fmt, il_lang_w, il_net_w, il_add_w, il_del_w);
             let _ = writeln!(out, "{}{}", pad, entry);
         }
     } else if compact {
         let (change_w, file_w) = col_widths_compact();
         for (i, (lang, a, d, f)) in total_langs.iter().enumerate() {
             let prefix = if i == total_langs.len() - 1 { "└── " } else { "├── " };
-            let fs = format!("{:>w$}", format_num(*f, short), w = file_w);
+            let fs = format!("{:>w$}", format_num(*f, num_fmt), w = file_w);
             let _ = writeln!(out, " {:<nw$}{}{}",
                 format!("{prefix}{lang}").cyan(),
-                format_changes_aligned(*a, *d, change_w, short, false, period_add_w, period_del_w),
+                format_changes_aligned(*a, *d, change_w, num_fmt, false, period_add_w, period_del_w),
                 fs.yellow(),
                 nw = NAME_WIDTH);
         }
@@ -756,7 +774,7 @@ fn render_period_table(
             let prefix = if i == total_langs.len() - 1 { "└── " } else { "├── " };
             let _ = writeln!(out, "{}", format_row_3_colored(
                 &format!("{prefix}{lang}"),
-                [&format_num(*a, short), &format_num(*d, short), &format_num(*f, short)],
+                [&format_num(*a, num_fmt), &format_num(*d, num_fmt), &format_num(*f, num_fmt)],
                 0, true,
             ));
         }
@@ -774,7 +792,7 @@ pub fn render_stats_table(
     dedup: &DedupMode,
     identity_map: &HashMap<String, String>,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
     inline_tree: bool,
 ) -> String {
@@ -783,10 +801,10 @@ pub fn render_stats_table(
     }
 
     match group_by {
-        GroupBy::Language => render_language_table(stats, totals, sort, short, compact),
-        GroupBy::Author => render_author_table(stats, totals, email_display, dedup, identity_map, sort, short, compact, inline_tree),
-        GroupBy::Period => render_period_table(stats, totals, sort, short, compact, inline_tree),
-        GroupBy::Repo => render_period_table(stats, totals, sort, short, compact, inline_tree),
+        GroupBy::Language => render_language_table(stats, totals, sort, num_fmt, compact),
+        GroupBy::Author => render_author_table(stats, totals, email_display, dedup, identity_map, sort, num_fmt, compact, inline_tree),
+        GroupBy::Period => render_period_table(stats, totals, sort, num_fmt, compact, inline_tree),
+        GroupBy::Repo => render_period_table(stats, totals, sort, num_fmt, compact, inline_tree),
     }
 }
 
@@ -795,7 +813,7 @@ pub fn render_group_tree(
     nodes: &[GroupNode],
     leaf_group: &GroupBy,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
     inline_tree: bool,
 ) -> String {
@@ -803,7 +821,7 @@ pub fn render_group_tree(
         nodes,
         leaf_group,
         sort,
-        short,
+        num_fmt,
         compact,
         inline_tree,
         0,
@@ -814,7 +832,7 @@ fn render_group_tree_inner(
     nodes: &[GroupNode],
     leaf_group: &GroupBy,
     sort: Option<&SortBy>,
-    short: bool,
+    num_fmt: NumberFormat,
     compact: bool,
     inline_tree: bool,
     depth: usize,
@@ -829,9 +847,9 @@ fn render_group_tree_inner(
         let rows: Vec<PeriodStats> = nodes.iter().map(|n| n.stats.clone()).collect();
         let totals = crate::stats::aggregator::aggregate_totals(&rows);
         return match leaf_group {
-            GroupBy::Language => render_language_table(&rows, &totals, sort, short, compact),
+            GroupBy::Language => render_language_table(&rows, &totals, sort, num_fmt, compact),
             GroupBy::Author | GroupBy::Period | GroupBy::Repo => {
-                render_period_table(&rows, &totals, sort, short, compact, inline_tree)
+                render_period_table(&rows, &totals, sort, num_fmt, compact, inline_tree)
             }
         };
     }
@@ -843,8 +861,8 @@ fn render_group_tree_inner(
         }
 
         let indent = "  ".repeat(depth);
-        let add_str = format!("+{}", format_num(node.stats.total_additions, short));
-        let del_str = format!("-{}", format_num(node.stats.total_deletions, short));
+        let add_str = format!("+{}", format_num(node.stats.total_additions, num_fmt));
+        let del_str = format!("-{}", format_num(node.stats.total_deletions, num_fmt));
         let _ = writeln!(
             out,
             "\n{}━━ {} ({} commits, {}/{})",
@@ -859,7 +877,7 @@ fn render_group_tree_inner(
             &node.children,
             leaf_group,
             sort,
-            short,
+            num_fmt,
             compact,
             inline_tree,
             depth + 1,
@@ -871,8 +889,8 @@ fn render_group_tree_inner(
         let grand_total = crate::stats::aggregator::aggregate_totals(
             &nodes.iter().map(|n| n.stats.clone()).collect::<Vec<_>>(),
         );
-        let add_str = format!("+{}", format_num(grand_total.total_additions, short));
-        let del_str = format!("-{}", format_num(grand_total.total_deletions, short));
+        let add_str = format!("+{}", format_num(grand_total.total_additions, num_fmt));
+        let del_str = format!("-{}", format_num(grand_total.total_deletions, num_fmt));
         let _ = writeln!(out);
         let _ = writeln!(out, "{}", "━".repeat(LINE_WIDTH));
         let _ = writeln!(
@@ -993,7 +1011,7 @@ mod tests {
             3,
         );
 
-        let output = render_stats_table(&[period], &totals, &GroupBy::Language, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false);
+        let output = render_stats_table(&[period], &totals, &GroupBy::Language, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false);
 
         assert!(output.contains("━"));
         assert!(output.contains("Language"));
@@ -1030,7 +1048,7 @@ mod tests {
         );
         let totals = make_period("Total", vec![("Rust", 200, 40, 7)], 7);
 
-        let output = render_stats_table(&[period], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false);
+        let output = render_stats_table(&[period], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false);
 
         assert!(output.contains("━"));
         assert!(output.contains("Author"));
@@ -1063,7 +1081,7 @@ mod tests {
         );
         let totals = make_period("Total", vec![("Rust", 200, 40, 7), ("Python", 50, 10, 3)], 7);
 
-        let output = render_stats_table(&[period], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false);
+        let output = render_stats_table(&[period], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false);
 
         // alice has 2 languages, should show tree
         assert!(output.contains("alice"));
@@ -1083,7 +1101,7 @@ mod tests {
         let p2 = make_period("2025-02", vec![("Rust", 80, 15, 4)], 3);
         let totals = make_period("Total", vec![("Rust", 180, 35, 9), ("Go", 50, 10, 3)], 8);
 
-        let output = render_stats_table(&[p1, p2], &totals, &GroupBy::Period, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false);
+        let output = render_stats_table(&[p1, p2], &totals, &GroupBy::Period, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false);
 
         assert!(output.contains("━"));
         assert!(output.contains("─"));
@@ -1117,7 +1135,7 @@ mod tests {
             &DedupMode::Name,
             &HashMap::new(),
             None,
-            false,
+            NumberFormat::Plain,
             false,
             false,
         );
@@ -1137,32 +1155,42 @@ mod tests {
         let totals = make_period("Total", vec![], 0);
 
         assert_eq!(
-            render_stats_table(&[], &totals, &GroupBy::Language, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
+            render_stats_table(&[], &totals, &GroupBy::Language, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false),
             "No data to display"
         );
         assert_eq!(
-            render_stats_table(&[], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
+            render_stats_table(&[], &totals, &GroupBy::Author, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false),
             "No data to display"
         );
         assert_eq!(
-            render_stats_table(&[], &totals, &GroupBy::Period, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
+            render_stats_table(&[], &totals, &GroupBy::Period, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false),
             "No data to display"
         );
         assert_eq!(
-            render_stats_table(&[], &totals, &GroupBy::Repo, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
+            render_stats_table(&[], &totals, &GroupBy::Repo, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, NumberFormat::Plain, false, false),
             "No data to display"
         );
     }
 
     #[test]
     fn test_short_numbers() {
-        assert_eq!(format_num(999, true), "999");
-        assert_eq!(format_num(1000, true), "1.0k");
-        assert_eq!(format_num(1500, true), "1.5k");
-        assert_eq!(format_num(1_000_000, true), "1.0M");
-        assert_eq!(format_num(2_500_000, true), "2.5M");
-        assert_eq!(format_num(42, false), "42");
-        assert_eq!(format_num(1500, false), "1500");
+        assert_eq!(format_num(999, NumberFormat::Short), "999");
+        assert_eq!(format_num(1000, NumberFormat::Short), "1.0k");
+        assert_eq!(format_num(1500, NumberFormat::Short), "1.5k");
+        assert_eq!(format_num(1_000_000, NumberFormat::Short), "1.0M");
+        assert_eq!(format_num(2_500_000, NumberFormat::Short), "2.5M");
+        assert_eq!(format_num(42, NumberFormat::Plain), "42");
+        assert_eq!(format_num(1500, NumberFormat::Plain), "1500");
+    }
+
+    #[test]
+    fn test_separated_numbers() {
+        assert_eq!(format_num(0, NumberFormat::Separated), "0");
+        assert_eq!(format_num(999, NumberFormat::Separated), "999");
+        assert_eq!(format_num(1_000, NumberFormat::Separated), "1,000");
+        assert_eq!(format_num(12_345, NumberFormat::Separated), "12,345");
+        assert_eq!(format_num(1_234_567, NumberFormat::Separated), "1,234,567");
+        assert_eq!(format_num(1_000_000_000, NumberFormat::Separated), "1,000,000,000");
     }
 
     #[test]

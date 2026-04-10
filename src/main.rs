@@ -117,6 +117,7 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     let period = args.period.unwrap_or(Period::Month);
     let author_filter = args.author.as_deref();
     let lang_filter = args.lang.as_deref();
+    let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
 
     if let Err(e) = stats::aggregator::validate_groups(&args.group) {
         anyhow::bail!(e);
@@ -141,7 +142,7 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
                     &nodes,
                     &leaf_group,
                     args.sort.as_ref(),
-                    args.short,
+                    num_fmt,
                     args.compact,
                     args.inline_tree,
                 );
@@ -176,7 +177,7 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
 
         match args.format {
             OutputFormat::Table => {
-                let content = output::table::render_stats_table(&period_stats, &totals, &group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), args.short, args.compact, args.inline_tree);
+                let content = output::table::render_stats_table(&period_stats, &totals, &group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), num_fmt, args.compact, args.inline_tree);
                 write_output(content, args.output.as_deref())?;
             }
             OutputFormat::Json => {
@@ -275,6 +276,7 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
     )?;
 
     let period = args.period.unwrap_or(Period::Month);
+    let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
 
     if let Err(e) = stats::aggregator::validate_groups(&args.group) {
         anyhow::bail!(e);
@@ -330,7 +332,7 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
                 &dedup,
                 &identity_map,
                 args.sort.as_ref(),
-                args.short,
+                num_fmt,
                 args.compact,
                 args.inline_tree,
             );
@@ -399,6 +401,7 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
         &summary,
         days_value,
         args.short,
+        args.number_format,
         args.lang_rows,
         args.title.as_deref(),
     )?;
@@ -616,6 +619,6 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
         });
     }
 
-    let svg = github::render_multi_card(&columns)?;
+    let svg = github::render_multi_card(&columns, args.number_format)?;
     write_output(svg, args.output.as_deref())
 }

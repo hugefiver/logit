@@ -1,8 +1,10 @@
 use serde::Serialize;
 use tera::{Context, Tera};
 
+use crate::cli::NumberFormat;
 use crate::github::api::GithubUser;
 use crate::github::ContributionSummary;
+use crate::output::table::format_num;
 use crate::stats::models::PeriodStats;
 
 const TEMPLATE: &str = include_str!("../templates/profile_card.svg");
@@ -109,6 +111,7 @@ pub fn render_profile_card(
     summary: &ContributionSummary,
     days: u64,
     short: bool,
+    num_fmt: NumberFormat,
     lang_rows: usize,
     custom_title: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -130,6 +133,7 @@ pub fn render_profile_card(
         active_repos,
         summary,
         short,
+        num_fmt,
         card_width,
     );
 
@@ -168,7 +172,10 @@ pub fn render_profile_card(
     Ok(tera.render("card", &ctx)?)
 }
 
-pub fn render_multi_card(data: &[MultiColumnData]) -> anyhow::Result<String> {
+pub fn render_multi_card(
+    data: &[MultiColumnData],
+    num_fmt: NumberFormat,
+) -> anyhow::Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("multi", MULTI_TEMPLATE)?;
 
@@ -201,7 +208,7 @@ pub fn render_multi_card(data: &[MultiColumnData]) -> anyhow::Result<String> {
             StatItem {
                 icon: ICON_REPOS.to_string(),
                 label: "Repos:".to_string(),
-                value: col_data.active_repos.to_string(),
+                value: format_num(col_data.active_repos as u64, num_fmt),
                 value_class: "stat-val".to_string(),
                 value_x,
                 x: stat_x,
@@ -210,7 +217,7 @@ pub fn render_multi_card(data: &[MultiColumnData]) -> anyhow::Result<String> {
             StatItem {
                 icon: ICON_COMMITS.to_string(),
                 label: "Commits:".to_string(),
-                value: total_commits.to_string(),
+                value: format_num(total_commits, num_fmt),
                 value_class: "stat-val".to_string(),
                 value_x,
                 x: stat_x,
@@ -219,7 +226,7 @@ pub fn render_multi_card(data: &[MultiColumnData]) -> anyhow::Result<String> {
             StatItem {
                 icon: ICON_PLUS.to_string(),
                 label: "Added:".to_string(),
-                value: format!("+{total_additions}"),
+                value: format!("+{}", format_num(total_additions, num_fmt)),
                 value_class: "stat-add".to_string(),
                 value_x,
                 x: stat_x,
@@ -228,7 +235,7 @@ pub fn render_multi_card(data: &[MultiColumnData]) -> anyhow::Result<String> {
             StatItem {
                 icon: ICON_MINUS.to_string(),
                 label: "Deleted:".to_string(),
-                value: format!("-{total_deletions}"),
+                value: format!("-{}", format_num(total_deletions, num_fmt)),
                 value_class: "stat-del".to_string(),
                 value_x,
                 x: stat_x,
@@ -345,6 +352,7 @@ fn build_stat_items(
     active_repos: usize,
     summary: &ContributionSummary,
     short: bool,
+    num_fmt: NumberFormat,
     card_width: usize,
 ) -> Vec<StatItem> {
     let mut items = Vec::new();
@@ -381,7 +389,7 @@ fn build_stat_items(
             0,
             ICON_COMMITS,
             "Total Commits:",
-            total_commits.to_string(),
+            format_num(total_commits, num_fmt),
             "stat-val",
         );
         push(
@@ -389,7 +397,7 @@ fn build_stat_items(
             0,
             ICON_REPOS,
             "Active Repos:",
-            active_repos.to_string(),
+            format_num(active_repos as u64, num_fmt),
             "stat-val",
         );
 
@@ -398,7 +406,7 @@ fn build_stat_items(
             1,
             ICON_PLUS,
             "Lines Added:",
-            format!("+{total_additions}"),
+            format!("+{}", format_num(total_additions, num_fmt)),
             "stat-add",
         );
         push(
@@ -406,7 +414,7 @@ fn build_stat_items(
             1,
             ICON_MINUS,
             "Lines Deleted:",
-            format!("-{total_deletions}"),
+            format!("-{}", format_num(total_deletions, num_fmt)),
             "stat-del",
         );
 
@@ -415,7 +423,7 @@ fn build_stat_items(
             2,
             ICON_PR,
             "Pull Requests:",
-            summary.total_prs.to_string(),
+            format_num(summary.total_prs as u64, num_fmt),
             "stat-val",
         );
         push(
@@ -423,7 +431,7 @@ fn build_stat_items(
             2,
             ICON_ISSUE,
             "Issues:",
-            summary.total_issues.to_string(),
+            format_num(summary.total_issues as u64, num_fmt),
             "stat-val",
         );
 
@@ -432,12 +440,18 @@ fn build_stat_items(
 
     let (net_value, net_class) = if total_additions >= total_deletions {
         (
-            format!("+{}", total_additions - total_deletions),
+            format!(
+                "+{}",
+                format_num(total_additions - total_deletions, num_fmt)
+            ),
             "stat-add",
         )
     } else {
         (
-            format!("-{}", total_deletions - total_additions),
+            format!(
+                "-{}",
+                format_num(total_deletions - total_additions, num_fmt)
+            ),
             "stat-del",
         )
     };
@@ -447,7 +461,7 @@ fn build_stat_items(
         0,
         ICON_COMMITS,
         "Total Commits:",
-        total_commits.to_string(),
+        format_num(total_commits, num_fmt),
         "stat-val",
     );
     push(
@@ -455,7 +469,7 @@ fn build_stat_items(
         0,
         ICON_REPOS,
         "Active Repos:",
-        active_repos.to_string(),
+        format_num(active_repos as u64, num_fmt),
         "stat-val",
     );
     push(
@@ -463,7 +477,7 @@ fn build_stat_items(
         0,
         ICON_PR,
         "Pull Requests:",
-        summary.total_prs.to_string(),
+        format_num(summary.total_prs as u64, num_fmt),
         "stat-val",
     );
 
@@ -472,7 +486,7 @@ fn build_stat_items(
         1,
         ICON_PLUS,
         "Lines Added:",
-        format!("+{total_additions}"),
+        format!("+{}", format_num(total_additions, num_fmt)),
         "stat-add",
     );
     push(
@@ -480,7 +494,7 @@ fn build_stat_items(
         1,
         ICON_MINUS,
         "Lines Deleted:",
-        format!("-{total_deletions}"),
+        format!("-{}", format_num(total_deletions, num_fmt)),
         "stat-del",
     );
     push(2, 1, ICON_NET_CHANGE, "Net Change:", net_value, net_class);
@@ -490,7 +504,7 @@ fn build_stat_items(
         2,
         ICON_PR,
         "PR Reviews:",
-        summary.total_reviews.to_string(),
+        format_num(summary.total_reviews as u64, num_fmt),
         "stat-val",
     );
     push(
@@ -498,7 +512,7 @@ fn build_stat_items(
         2,
         ICON_ISSUE,
         "Issues:",
-        summary.total_issues.to_string(),
+        format_num(summary.total_issues as u64, num_fmt),
         "stat-val",
     );
     push(
@@ -640,6 +654,7 @@ mod tests {
             &summary,
             30,
             false,
+            NumberFormat::Plain,
             2,
             None,
         )
@@ -660,8 +675,19 @@ mod tests {
     fn output_is_valid_svg() {
         let user = make_user(5);
         let summary = ContributionSummary::default();
-        let svg =
-            render_profile_card("testuser", &user, None, 5, &summary, 30, false, 2, None).unwrap();
+        let svg = render_profile_card(
+            "testuser",
+            &user,
+            None,
+            5,
+            &summary,
+            30,
+            false,
+            NumberFormat::Plain,
+            2,
+            None,
+        )
+        .unwrap();
         let trimmed = svg.trim();
 
         assert!(trimmed.starts_with("<svg"));
@@ -672,8 +698,19 @@ mod tests {
     fn render_without_stats() {
         let user = make_user(3);
         let summary = ContributionSummary::default();
-        let svg =
-            render_profile_card("ghostuser", &user, None, 5, &summary, 30, false, 2, None).unwrap();
+        let svg = render_profile_card(
+            "ghostuser",
+            &user,
+            None,
+            5,
+            &summary,
+            30,
+            false,
+            NumberFormat::Plain,
+            2,
+            None,
+        )
+        .unwrap();
 
         assert!(
             svg.contains("ghostuser&#x27;s Git Stats") || svg.contains("ghostuser's Git Stats")
@@ -690,8 +727,19 @@ mod tests {
             total_reviews: 1,
             total_issues: 4,
         };
-        let svg =
-            render_profile_card("ghostuser", &user, None, 2, &summary, 30, true, 2, None).unwrap();
+        let svg = render_profile_card(
+            "ghostuser",
+            &user,
+            None,
+            2,
+            &summary,
+            30,
+            true,
+            NumberFormat::Plain,
+            2,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(svg.matches("class=\"stat-label\"").count(), 6);
         assert!(svg.contains("Pull Requests:"));
@@ -788,6 +836,7 @@ mod tests {
             &summary,
             30,
             false,
+            NumberFormat::Plain,
             2,
             Some("Custom"),
         )

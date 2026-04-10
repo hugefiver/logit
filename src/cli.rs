@@ -2,6 +2,22 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NumberFormat {
+    /// Numbers with thousand separators (1,234,567)
+    Separated,
+    /// Plain numbers without separators (1234567)
+    Plain,
+    /// Short format with suffixes (1.2k, 3.4M)
+    Short,
+}
+
+impl Default for NumberFormat {
+    fn default() -> Self {
+        NumberFormat::Separated
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "logit", version, about = "lines of git")]
 pub struct Cli {
@@ -107,7 +123,14 @@ pub struct StatsArgs {
     #[arg(long, value_enum, help = "Sort by column")]
     pub sort: Option<SortBy>,
 
-    #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
+    #[arg(long, value_enum, default_value_t = NumberFormat::Separated, help = "Number display format")]
+    pub number_format: NumberFormat,
+
+    #[arg(
+        long,
+        help = "Shorthand for --number-format short",
+        conflicts_with = "number_format"
+    )]
     pub short: bool,
 
     #[arg(long, help = "Show language details inline under each group")]
@@ -235,7 +258,14 @@ pub struct GithubFetchArgs {
     )]
     pub group: Vec<GroupBy>,
 
-    #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
+    #[arg(long, value_enum, default_value_t = NumberFormat::Separated, help = "Number display format")]
+    pub number_format: NumberFormat,
+
+    #[arg(
+        long,
+        help = "Shorthand for --number-format short",
+        conflicts_with = "number_format"
+    )]
     pub short: bool,
 
     #[arg(long, help = "Use compact single-line format for changes")]
@@ -308,6 +338,14 @@ pub struct GithubCardArgs {
 
     #[arg(
         long,
+        value_enum,
+        default_value_t = NumberFormat::Separated,
+        help = "Number display format in SVG stats"
+    )]
+    pub number_format: NumberFormat,
+
+    #[arg(
+        long,
         default_value_t = 2,
         help = "Number of language rows in legend (default: 2)"
     )]
@@ -359,6 +397,14 @@ pub struct GithubMultiArgs {
 
     #[arg(short = 'o', long, help = "Write SVG to file instead of stdout")]
     pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NumberFormat::Separated,
+        help = "Number display format in SVG stats"
+    )]
+    pub number_format: NumberFormat,
 }
 
 #[cfg(test)]
