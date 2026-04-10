@@ -76,9 +76,9 @@ pub fn render_profile_card(
     let languages = build_lang_bars(stats);
     let lang_rows = languages.len().div_ceil(3);
     let card_height = if languages.is_empty() {
-        115
+        135
     } else {
-        170 + lang_rows * 20 + 15
+        200 + lang_rows * 25 + 15
     };
     ctx.insert("languages", &languages);
     ctx.insert("card_height", &card_height);
@@ -124,10 +124,10 @@ fn build_lang_bars(stats: Option<&PeriodStats>) -> Vec<LangBar> {
             bar_x: x,
             bar_w: w,
             dot_cx: 30 + col * 155,
-            dot_cy: 170 + row * 20,
-            text_x: 38 + col * 155,
-            text_y: 174 + row * 20,
-            pct_x: 110 + col * 155,
+            dot_cy: 215 + row * 25,
+            text_x: 42 + col * 155,
+            text_y: 219 + row * 25,
+            pct_x: 120 + col * 155,
         });
         x += w;
     }
@@ -152,6 +152,7 @@ mod tests {
             avatar_url: "https://avatars.githubusercontent.com/u/583231".to_string(),
             html_url: "https://github.com/octocat".to_string(),
             created_at: "2011-01-25T18:44:36Z".to_string(),
+            node_id: "MDQ6VXNlcjU4MzIzMQ==".to_string(),
         }
     }
 

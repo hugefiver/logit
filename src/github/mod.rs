@@ -1,4 +1,5 @@
 pub mod api;
+pub mod cache;
 pub mod svg;
 
 pub use api::GithubClient;

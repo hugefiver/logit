@@ -86,7 +86,6 @@ fn format_author_name<'a>(author: &'a str, mode: &EmailDisplay) -> Cow<'a, str> 
 }
 
 fn heavy(w: usize) -> String { "━".repeat(w) }
-fn light(w: usize) -> String { "─".repeat(w) }
 
 fn col_widths_3() -> [usize; 3] {
     let remaining = LINE_WIDTH - NAME_WIDTH - 1;
@@ -124,29 +123,96 @@ fn col_widths_compact() -> (usize, usize) {
     (widths[0] + widths[1], widths[2])
 }
 
-fn format_changes_aligned(adds: u64, dels: u64, width: usize, short: bool, bold: bool) -> String {
+fn max_change_widths(items: &[(u64, u64)], short: bool) -> (usize, usize) {
+    let max_add = items
+        .iter()
+        .map(|(a, _)| format!("+{}", format_num(*a, short)).len())
+        .max()
+        .unwrap_or(2);
+    let max_del = items
+        .iter()
+        .map(|(_, d)| format!("-{}", format_num(*d, short)).len())
+        .max()
+        .unwrap_or(2);
+    (max_add, max_del)
+}
+
+fn format_changes_aligned(
+    adds: u64,
+    dels: u64,
+    width: usize,
+    short: bool,
+    bold: bool,
+    add_w: usize,
+    del_w: usize,
+) -> String {
     let add_s = format!("+{}", format_num(adds, short));
     let del_s = format!("-{}", format_num(dels, short));
-    let plain_len = add_s.len() + 1 + del_s.len();
+    let add_f = format!("{:>w$}", add_s, w = add_w);
+    let del_f = format!("{:>w$}", del_s, w = del_w);
+    let plain_len = add_w + 1 + del_w;
     let pad = width.saturating_sub(plain_len);
     if bold {
-        format!("{}{} {}", " ".repeat(pad), add_s.green().bold(), del_s.red().bold())
+        format!(
+            "{}{} {}",
+            " ".repeat(pad),
+            add_f.green().bold(),
+            del_f.red().bold()
+        )
     } else {
-        format!("{}{} {}", " ".repeat(pad), add_s.green(), del_s.red())
+        format!("{}{} {}", " ".repeat(pad), add_f.green(), del_f.red())
     }
 }
 
-fn format_inline_entry(prefix: &str, lang: &str, adds: u64, dels: u64, short: bool) -> String {
+fn max_inline_widths(items: &[(&str, u64, u64)], short: bool) -> (usize, usize, usize, usize) {
+    let lang_w = items.iter().map(|(l, _, _)| l.len()).max().unwrap_or(1);
+    let net_w = items.iter().map(|(_, a, d)| {
+        let net = *a as i64 - *d as i64;
+        format_num(net.unsigned_abs(), short).len() + 1
+    }).max().unwrap_or(2);
+    let add_w = items.iter().map(|(_, a, _)| {
+        format!("+{}", format_num(*a, short)).len()
+    }).max().unwrap_or(2);
+    let del_w = items.iter().map(|(_, _, d)| {
+        format!("-{}", format_num(*d, short)).len()
+    }).max().unwrap_or(2);
+    (lang_w, net_w, add_w, del_w)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_inline_entry(
+    prefix: &str,
+    lang: &str,
+    adds: u64,
+    dels: u64,
+    short: bool,
+    lang_w: usize,
+    net_w: usize,
+    add_w: usize,
+    del_w: usize,
+) -> String {
     let net = adds as i64 - dels as i64;
     let net_s = format_num(net.unsigned_abs(), short);
+    let net_display = if net >= 0 { format!("+{net_s}") } else { format!("-{net_s}") };
+    let net_aligned = format!("{:>w$}", net_display, w = net_w);
     let net_colored = if net >= 0 {
-        format!("+{net_s}").green().to_string()
+        net_aligned.green().to_string()
     } else {
-        format!("-{net_s}").red().to_string()
+        net_aligned.red().to_string()
     };
     let add_s = format!("+{}", format_num(adds, short));
     let del_s = format!("-{}", format_num(dels, short));
-    format!("{}{} {} ({} {})", prefix.dimmed(), lang.cyan(), net_colored, add_s.dimmed(), del_s.dimmed())
+    let add_aligned = format!("{:>w$}", add_s, w = add_w);
+    let del_aligned = format!("{:>w$}", del_s, w = del_w);
+    let lang_padded = format!("{:<w$}", lang, w = lang_w);
+    format!(
+        "{}{} {} ({} {})",
+        prefix.dimmed(),
+        lang_padded.cyan(),
+        net_colored,
+        add_aligned.dimmed(),
+        del_aligned.dimmed(),
+    )
 }
 
 fn format_header_3(headers: [&str; 4]) -> String {
@@ -326,10 +392,12 @@ fn render_language_table(
     let langs = aggregate_languages(stats, sort);
     let total_files: u64 = totals.by_language.values().map(|ls| ls.files_changed).sum();
 
-    let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
-
     if compact {
         let (change_w, file_w) = col_widths_compact();
+        let change_items: Vec<(u64, u64)> = langs.iter().map(|(_, a, d, _)| (*a, *d))
+            .chain(std::iter::once((totals.total_additions, totals.total_deletions)))
+            .collect();
+        let (add_w, del_w) = max_change_widths(&change_items, short);
         let _ = writeln!(out, " {:<name_w$}{:>cw$}{:>fw$}",
             "Language".bold(), "Changes".bold(), "Files".bold(),
             name_w = NAME_WIDTH, cw = change_w, fw = file_w);
@@ -339,7 +407,7 @@ fn render_language_table(
             let fs = format!("{:>w$}", format_num(*f, short), w = file_w);
             let _ = writeln!(out, " {:<nw$}{}{}",
                 lang.cyan(),
-                format_changes_aligned(*a, *d, change_w, short, false),
+                format_changes_aligned(*a, *d, change_w, short, false, add_w, del_w),
                 fs.yellow(),
                 nw = NAME_WIDTH);
         }
@@ -348,12 +416,13 @@ fn render_language_table(
         let fs = format!("{:>w$}", format_num(total_files, short), w = file_w);
         let _ = writeln!(out, " {:<nw$}{}{}",
             "Total".bold(),
-            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true),
+            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true, add_w, del_w),
             fs.bold(),
             nw = NAME_WIDTH);
     } else {
         let _ = writeln!(out, "{}", format_header_3(["Language", "Additions", "Deletions", "Files"]));
         let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
+
 
         for (lang, a, d, f) in &langs {
             let _ = writeln!(out, "{}", format_row_3_colored(
@@ -370,7 +439,6 @@ fn render_language_table(
             0, false,
         ).bold());
     }
-    let _ = write!(out, "{}", heavy(LINE_WIDTH).bold());
     out
 }
 
@@ -449,7 +517,24 @@ fn render_author_table(
         .max()
         .unwrap_or(1);
 
-    let _ = writeln!(out, "{}", heavy(line_w).bold());
+    let change_items: Vec<(u64, u64)> = authors.iter()
+        .flat_map(|r| {
+            let main = (r.total_additions(), r.total_deletions());
+            std::iter::once(main).chain(r.languages.iter().map(|(_, a, d, _)| (*a, *d)))
+        })
+        .chain(std::iter::once((totals.total_additions, totals.total_deletions)))
+        .collect();
+    let (chg_add_w, chg_del_w) = max_change_widths(&change_items, short);
+
+    let (il_lang_w, il_net_w, il_add_w, il_del_w) = if inline_tree {
+        let items: Vec<(&str, u64, u64)> = authors.iter()
+            .flat_map(|r| r.languages.iter().map(|(lang, a, d, _)| (lang.as_str(), *a, *d)))
+            .collect();
+        max_inline_widths(&items, short)
+    } else {
+        (0, 0, 0, 0)
+    };
+
     if compact {
         let _ = writeln!(
             out,
@@ -477,7 +562,7 @@ fn render_author_table(
                 " {:<name_w$}{}{}{:>num_w$}",
                 display_name.bright_white(),
                 c.bright_cyan(),
-                format_changes_aligned(total_adds, total_dels, change_w, short, false),
+                format_changes_aligned(total_adds, total_dels, change_w, short, false, chg_add_w, chg_del_w),
                 row.top_lang.yellow(),
             );
         } else {
@@ -500,7 +585,7 @@ fn render_author_table(
                 let pad = " ".repeat(offset);
                 for (i, (lang, la, ld, _lf)) in row.languages.iter().enumerate() {
                     let prefix = if i == row.languages.len() - 1 { "└── " } else { "├── " };
-                    let entry = format_inline_entry(prefix, lang, *la, *ld, short);
+                    let entry = format_inline_entry(prefix, lang, *la, *ld, short, il_lang_w, il_net_w, il_add_w, il_del_w);
                     let _ = writeln!(out, "{}{}", pad, entry);
                 }
             } else if compact {
@@ -511,7 +596,7 @@ fn render_author_table(
                         " {:<name_w$}{:>num_w$}{}{:>num_w$}",
                         format!("{prefix}{lang}").dimmed(),
                         "",
-                        format_changes_aligned(*la, *ld, change_w, short, false),
+                        format_changes_aligned(*la, *ld, change_w, short, false, chg_add_w, chg_del_w),
                         "",
                     );
                 }
@@ -531,7 +616,6 @@ fn render_author_table(
                     );
                 }
             }
-            let _ = writeln!(out, "{}", light(line_w).dimmed());
         }
     }
 
@@ -542,7 +626,7 @@ fn render_author_table(
             " {:<name_w$}{}{}{:>num_w$}",
             "Total".bold(),
             format_co_aligned(totals.total_commits, 0, short, max_commit_main, num_w).bold(),
-            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true),
+            format_changes_aligned(totals.total_additions, totals.total_deletions, change_w, short, true, chg_add_w, chg_del_w),
             "",
         );
     } else {
@@ -556,7 +640,6 @@ fn render_author_table(
             "",
         );
     }
-    let _ = write!(out, "{}", heavy(line_w).bold());
     out
 }
 
@@ -569,8 +652,24 @@ fn render_period_table(
     inline_tree: bool,
 ) -> String {
     let mut out = String::new();
+    let total_langs = aggregate_languages(stats, sort);
 
-    let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
+    let change_items: Vec<(u64, u64)> = stats.iter()
+        .flat_map(|p| p.by_language.values().map(|ls| (ls.additions, ls.deletions)))
+        .chain(total_langs.iter().map(|(_, a, d, _)| (*a, *d)))
+        .collect();
+    let (period_add_w, period_del_w) = max_change_widths(&change_items, short);
+
+    let (il_lang_w, il_net_w, il_add_w, il_del_w) = if inline_tree {
+        let items: Vec<(&str, u64, u64)> = stats.iter()
+            .flat_map(|p| p.by_language.iter().map(|(lang, ls)| (lang.as_str(), ls.additions, ls.deletions)))
+            .chain(total_langs.iter().map(|(lang, a, d, _)| (lang.as_str(), *a, *d)))
+            .collect();
+        max_inline_widths(&items, short)
+    } else {
+        (0, 0, 0, 0)
+    };
+
     if !inline_tree {
         if compact {
             let (change_w, file_w) = col_widths_compact();
@@ -580,15 +679,14 @@ fn render_period_table(
         } else {
             let _ = writeln!(out, "{}", format_header_3(["Language", "Additions", "Deletions", "Files"]));
         }
-        let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
     }
+    let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
 
     for period in stats {
         let _ = writeln!(out, " {} ({})",
             period.period_label.bright_blue().bold(),
             format!("{} commits", period.total_commits).dimmed(),
         );
-        let _ = writeln!(out, "{}", light(LINE_WIDTH).dimmed());
 
         let mut langs: Vec<_> = period.by_language.iter().collect();
         match sort.unwrap_or(&SortBy::Additions) {
@@ -602,7 +700,7 @@ fn render_period_table(
             let pad = " ".repeat(NAME_WIDTH + 1);
             for (i, (lang, ls)) in langs.iter().enumerate() {
                 let prefix = if i == langs.len() - 1 { "└── " } else { "├── " };
-                let entry = format_inline_entry(prefix, lang, ls.additions, ls.deletions, short);
+                let entry = format_inline_entry(prefix, lang, ls.additions, ls.deletions, short, il_lang_w, il_net_w, il_add_w, il_del_w);
                 let _ = writeln!(out, "{}{}", pad, entry);
             }
         } else if compact {
@@ -612,7 +710,7 @@ fn render_period_table(
                 let fs = format!("{:>w$}", format_num(ls.files_changed, short), w = file_w);
                 let _ = writeln!(out, " {:<nw$}{}{}",
                     format!("{prefix}{lang}").cyan(),
-                    format_changes_aligned(ls.additions, ls.deletions, change_w, short, false),
+                    format_changes_aligned(ls.additions, ls.deletions, change_w, short, false, period_add_w, period_del_w),
                     fs.yellow(),
                     nw = NAME_WIDTH);
             }
@@ -626,7 +724,6 @@ fn render_period_table(
                 ));
             }
         }
-        let _ = writeln!(out, "{}", light(LINE_WIDTH).dimmed());
     }
 
     let _ = writeln!(out, "{}", heavy(LINE_WIDTH).bold());
@@ -635,14 +732,12 @@ fn render_period_table(
         "Total".bold(),
         format!("{total_commits} commits").dimmed(),
     );
-    let _ = writeln!(out, "{}", light(LINE_WIDTH).dimmed());
 
-    let total_langs = aggregate_languages(stats, sort);
     if inline_tree {
         let pad = " ".repeat(NAME_WIDTH + 1);
         for (i, (lang, a, d, _f)) in total_langs.iter().enumerate() {
             let prefix = if i == total_langs.len() - 1 { "└── " } else { "├── " };
-            let entry = format_inline_entry(prefix, lang, *a, *d, short);
+            let entry = format_inline_entry(prefix, lang, *a, *d, short, il_lang_w, il_net_w, il_add_w, il_del_w);
             let _ = writeln!(out, "{}{}", pad, entry);
         }
     } else if compact {
@@ -652,7 +747,7 @@ fn render_period_table(
             let fs = format!("{:>w$}", format_num(*f, short), w = file_w);
             let _ = writeln!(out, " {:<nw$}{}{}",
                 format!("{prefix}{lang}").cyan(),
-                format_changes_aligned(*a, *d, change_w, short, false),
+                format_changes_aligned(*a, *d, change_w, short, false, period_add_w, period_del_w),
                 fs.yellow(),
                 nw = NAME_WIDTH);
         }
@@ -667,7 +762,6 @@ fn render_period_table(
         }
     }
 
-    let _ = write!(out, "{}", heavy(LINE_WIDTH).bold());
     out
 }
 
@@ -692,23 +786,8 @@ pub fn render_stats_table(
         GroupBy::Language => render_language_table(stats, totals, sort, short, compact),
         GroupBy::Author => render_author_table(stats, totals, email_display, dedup, identity_map, sort, short, compact, inline_tree),
         GroupBy::Period => render_period_table(stats, totals, sort, short, compact, inline_tree),
+        GroupBy::Repo => render_period_table(stats, totals, sort, short, compact, inline_tree),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn print_stats(
-    stats: &[PeriodStats],
-    totals: &PeriodStats,
-    group_by: &GroupBy,
-    email_display: &EmailDisplay,
-    dedup: &DedupMode,
-    identity_map: &HashMap<String, String>,
-    sort: Option<&SortBy>,
-    short: bool,
-    compact: bool,
-    inline_tree: bool,
-) {
-    println!("{}", render_stats_table(stats, totals, group_by, email_display, dedup, identity_map, sort, short, compact, inline_tree));
 }
 
 pub fn render_scan_table(repos: &[PathBuf]) -> String {
@@ -732,10 +811,6 @@ pub fn render_scan_table(repos: &[PathBuf]) -> String {
     }
 
     table.to_string()
-}
-
-pub fn print_scan(repos: &[PathBuf]) {
-    println!("{}", render_scan_table(repos));
 }
 
 #[cfg(test)]
@@ -837,11 +912,11 @@ mod tests {
         assert!(output.contains("Total"));
 
         let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[0].contains("━"));
-        assert!(lines[2].contains("━"));
+        assert!(lines[0].contains("Language"));
+        assert!(lines[1].contains("━"));
         // Rust has more additions, should appear first
-        assert!(lines[3].contains("Rust"));
-        assert!(lines[4].contains("Python"));
+        assert!(lines[2].contains("Rust"));
+        assert!(lines[3].contains("Python"));
     }
 
     #[test]
@@ -873,8 +948,8 @@ mod tests {
 
         let lines: Vec<&str> = output.lines().collect();
         // alice has more commits, should appear first
-        assert!(lines[3].contains("alice"));
-        assert!(lines[4].contains("bob"));
+        assert!(lines[2].contains("alice"));
+        assert!(lines[3].contains("bob"));
     }
 
     #[test]
@@ -926,6 +1001,41 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_repo_format() {
+        colored::control::set_override(false);
+
+        let p1 = make_period(
+            "owner/repo-a",
+            vec![("Rust", 100, 20, 5), ("Go", 50, 10, 3)],
+            5,
+        );
+        let p2 = make_period("owner/repo-b", vec![("Rust", 80, 15, 4)], 3);
+        let totals = make_period("Total", vec![("Rust", 180, 35, 9), ("Go", 50, 10, 3)], 8);
+
+        let output = render_stats_table(
+            &[p1, p2],
+            &totals,
+            &GroupBy::Repo,
+            &EmailDisplay::None,
+            &DedupMode::Name,
+            &HashMap::new(),
+            None,
+            false,
+            false,
+            false,
+        );
+
+        assert!(output.contains("owner/repo-a"));
+        assert!(output.contains("owner/repo-b"));
+        assert!(output.contains("5 commits"));
+        assert!(output.contains("3 commits"));
+        assert!(output.contains("Rust"));
+        assert!(output.contains("Go"));
+        assert!(output.contains("Total"));
+        assert!(output.contains("8 commits"));
+    }
+
+    #[test]
     fn test_empty_returns_no_data() {
         let totals = make_period("Total", vec![], 0);
 
@@ -939,6 +1049,10 @@ mod tests {
         );
         assert_eq!(
             render_stats_table(&[], &totals, &GroupBy::Period, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
+            "No data to display"
+        );
+        assert_eq!(
+            render_stats_table(&[], &totals, &GroupBy::Repo, &EmailDisplay::None, &DedupMode::Name, &HashMap::new(), None, false, false, false),
             "No data to display"
         );
     }

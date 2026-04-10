@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::cli::Period;
-use crate::stats::models::{AuthorStats, CommitStats, PeriodStats};
+use crate::stats::models::{AuthorStats, CommitStats, LangStats, PeriodStats};
 
 /// Bucket a timestamp into a period label string.
 /// - Day: "2024-01-15"
@@ -33,6 +33,34 @@ pub fn aggregate_commits(
     author_filter: Option<&str>,
     lang_filter: Option<&str>,
 ) -> Vec<PeriodStats> {
+    aggregate_commits_with_bucket_key(commits, author_filter, lang_filter, |commit| {
+        bucket_timestamp(&commit.timestamp, period)
+    })
+}
+
+/// Aggregate a slice of commits into per-repo statistics.
+///
+/// The output shape is identical to period aggregation, but `period_label`
+/// contains the repository name from `CommitStats.repo`.
+pub fn aggregate_by_repo(
+    commits: &[CommitStats],
+    author_filter: Option<&str>,
+    lang_filter: Option<&str>,
+) -> Vec<PeriodStats> {
+    aggregate_commits_with_bucket_key(commits, author_filter, lang_filter, |commit| {
+        commit.repo.clone()
+    })
+}
+
+fn aggregate_commits_with_bucket_key<F>(
+    commits: &[CommitStats],
+    author_filter: Option<&str>,
+    lang_filter: Option<&str>,
+    bucket_key: F,
+) -> Vec<PeriodStats>
+where
+    F: Fn(&CommitStats) -> String,
+{
     use crate::git::author::commit_involves_author;
 
     let mut buckets: HashMap<String, PeriodStats> = HashMap::new();
@@ -44,7 +72,7 @@ pub fn aggregate_commits(
             continue;
         }
 
-        let label = bucket_timestamp(&commit.timestamp, period);
+        let label = bucket_key(commit);
         let ps = buckets.entry(label.clone()).or_insert_with(|| PeriodStats {
             period_label: label,
             by_language: HashMap::new(),
@@ -57,7 +85,7 @@ pub fn aggregate_commits(
         ps.total_commits += 1;
 
         let author_key = format!("{} <{}>", commit.author.name, commit.author.email);
-        let author_entry = ps.by_author.entry(author_key).or_default();
+        let author_entry = ps.by_author.entry(author_key.clone()).or_default();
         author_entry.commits += 1;
 
         for co in &commit.co_authors {
@@ -84,7 +112,7 @@ pub fn aggregate_commits(
             lang_entry.files_changed += 1;
 
             {
-                let author_entry = ps.by_author.get_mut(&format!("{} <{}>", commit.author.name, commit.author.email)).expect("just inserted");
+                let author_entry = ps.by_author.get_mut(&author_key).expect("just inserted");
                 author_entry.additions += fc.additions;
                 author_entry.deletions += fc.deletions;
 
@@ -111,6 +139,72 @@ pub fn aggregate_commits(
     let mut result: Vec<PeriodStats> = buckets.into_values().collect();
     result.sort_by(|a, b| a.period_label.cmp(&b.period_label));
     result
+}
+
+/// Remove excluded languages (case-insensitive) from period rows and totals.
+///
+/// This removes matching languages from:
+/// - `PeriodStats.by_language`
+/// - each author's `AuthorStats.languages`
+///
+/// and adjusts additions/deletions counters accordingly.
+pub fn filter_excluded_languages(
+    stats: &mut Vec<PeriodStats>,
+    totals: &mut PeriodStats,
+    excluded: &[String],
+) {
+    if excluded.is_empty() {
+        return;
+    }
+
+    for period in stats {
+        remove_excluded_from_period(period, excluded);
+    }
+
+    remove_excluded_from_period(totals, excluded);
+}
+
+fn remove_excluded_from_period(period: &mut PeriodStats, excluded: &[String]) {
+    for lang in excluded {
+        if let Some(removed) = remove_language_case_insensitive(&mut period.by_language, lang) {
+            period.total_additions = period.total_additions.saturating_sub(removed.additions);
+            period.total_deletions = period.total_deletions.saturating_sub(removed.deletions);
+        }
+
+        for author_stats in period.by_author.values_mut() {
+            if let Some(removed) = remove_language_case_insensitive(&mut author_stats.languages, lang)
+            {
+                author_stats.additions = author_stats.additions.saturating_sub(removed.additions);
+                author_stats.deletions = author_stats.deletions.saturating_sub(removed.deletions);
+            }
+        }
+    }
+}
+
+fn remove_language_case_insensitive(
+    map: &mut HashMap<String, LangStats>,
+    lang: &str,
+) -> Option<LangStats> {
+    let keys: Vec<String> = map
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(lang))
+        .cloned()
+        .collect();
+
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut removed_total = LangStats::default();
+    for key in keys {
+        if let Some(removed) = map.remove(&key) {
+            removed_total.additions += removed.additions;
+            removed_total.deletions += removed.deletions;
+            removed_total.files_changed += removed.files_changed;
+        }
+    }
+
+    Some(removed_total)
 }
 
 /// Merge all period stats into a single summary with `period_label = "Total"`.
@@ -226,6 +320,19 @@ mod tests {
             message_subject: "test commit".to_string(),
             file_changes,
         }
+    }
+
+    fn make_commit_in_repo(
+        repo: &str,
+        author_name: &str,
+        author_email: &str,
+        co_authors: Vec<Author>,
+        ts: DateTime<Utc>,
+        file_changes: Vec<FileChange>,
+    ) -> CommitStats {
+        let mut commit = make_commit(author_name, author_email, co_authors, ts, file_changes);
+        commit.repo = repo.to_string();
+        commit
     }
 
     fn rust_file(path: &str, adds: u64, dels: u64) -> FileChange {
@@ -436,5 +543,104 @@ mod tests {
         assert_eq!(result[0].by_language.len(), 1);
         assert!(result[0].by_language.contains_key("Other"));
         assert_eq!(result[0].by_language["Other"].additions, 5);
+    }
+
+    #[test]
+    fn aggregate_by_repo_groups_by_repo_name() {
+        let commits = vec![
+            make_commit_in_repo(
+                "repo-z",
+                "Alice",
+                "alice@test.com",
+                vec![],
+                Utc.with_ymd_and_hms(2024, 1, 10, 12, 0, 0).unwrap(),
+                vec![rust_file("src/a.rs", 10, 2)],
+            ),
+            make_commit_in_repo(
+                "repo-a",
+                "Bob",
+                "bob@test.com",
+                vec![],
+                Utc.with_ymd_and_hms(2024, 1, 20, 12, 0, 0).unwrap(),
+                vec![py_file("scripts/a.py", 7, 1)],
+            ),
+            make_commit_in_repo(
+                "repo-z",
+                "Alice",
+                "alice@test.com",
+                vec![],
+                Utc.with_ymd_and_hms(2024, 2, 5, 12, 0, 0).unwrap(),
+                vec![py_file("scripts/b.py", 5, 3)],
+            ),
+        ];
+
+        let result = aggregate_by_repo(&commits, None, None);
+
+        assert_eq!(result.len(), 2);
+        // Sorted by repo label ascending
+        assert_eq!(result[0].period_label, "repo-a");
+        assert_eq!(result[0].total_commits, 1);
+        assert_eq!(result[0].total_additions, 7);
+        assert_eq!(result[0].total_deletions, 1);
+        assert_eq!(result[0].by_language["Python"].additions, 7);
+
+        assert_eq!(result[1].period_label, "repo-z");
+        assert_eq!(result[1].total_commits, 2);
+        assert_eq!(result[1].total_additions, 15);
+        assert_eq!(result[1].total_deletions, 5);
+        assert_eq!(result[1].by_language["Rust"].additions, 10);
+        assert_eq!(result[1].by_language["Python"].additions, 5);
+    }
+
+    #[test]
+    fn filter_excluded_languages_removes_from_periods_totals_and_authors() {
+        let commits = vec![
+            make_commit_in_repo(
+                "repo-a",
+                "Alice",
+                "alice@test.com",
+                vec![],
+                Utc.with_ymd_and_hms(2024, 1, 10, 12, 0, 0).unwrap(),
+                vec![rust_file("src/a.rs", 10, 2), py_file("scripts/a.py", 5, 1)],
+            ),
+            make_commit_in_repo(
+                "repo-b",
+                "Bob",
+                "bob@test.com",
+                vec![],
+                Utc.with_ymd_and_hms(2024, 1, 12, 12, 0, 0).unwrap(),
+                vec![rust_file("src/b.rs", 7, 3)],
+            ),
+        ];
+
+        let mut periods = aggregate_by_repo(&commits, None, None);
+        let mut totals = aggregate_totals(&periods);
+
+        let excluded = vec!["rUsT".to_string()];
+        filter_excluded_languages(&mut periods, &mut totals, &excluded);
+
+        for period in &periods {
+            assert!(!period.by_language.contains_key("Rust"));
+            for author in period.by_author.values() {
+                assert!(!author.languages.contains_key("Rust"));
+            }
+        }
+
+        // Only Python stats should remain: +5/-1
+        assert_eq!(totals.total_additions, 5);
+        assert_eq!(totals.total_deletions, 1);
+        assert!(!totals.by_language.contains_key("Rust"));
+        assert!(totals.by_language.contains_key("Python"));
+
+        let alice = totals.by_author.get("Alice <alice@test.com>").unwrap();
+        assert_eq!(alice.additions, 5);
+        assert_eq!(alice.deletions, 1);
+        assert!(!alice.languages.contains_key("Rust"));
+        assert!(alice.languages.contains_key("Python"));
+
+        let bob = totals.by_author.get("Bob <bob@test.com>").unwrap();
+        assert_eq!(bob.additions, 0);
+        assert_eq!(bob.deletions, 0);
+        assert!(!bob.languages.contains_key("Rust"));
     }
 }

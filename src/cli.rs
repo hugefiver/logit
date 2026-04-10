@@ -21,8 +21,11 @@ pub enum Commands {
 pub struct ScanArgs {
     pub path: PathBuf,
 
-    #[arg(long, value_enum, default_value_t = ScanFormat::Table)]
-    pub output: ScanFormat,
+    #[arg(short = 'f', long, value_enum, default_value_t = ScanFormat::Table)]
+    pub format: ScanFormat,
+
+    #[arg(short = 'o', long, help = "Write output to file instead of stdout")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -36,42 +39,55 @@ pub struct StatsArgs {
     #[arg(long, default_value = ".")]
     pub path: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, help = "Filter by author name or email")]
     pub author: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Filter by committer name or email")]
     pub committer: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Only show stats since this date (YYYY-MM-DD)")]
     pub since: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Only show stats until this date (YYYY-MM-DD)")]
     pub until: Option<String>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Period granularity for stats")]
     pub period: Option<Period>,
 
-    #[arg(long)]
+    #[arg(long, help = "Filter commits by programming language")]
     pub lang: Option<String>,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
+    #[arg(
+        long,
+        help = "Exclude languages from stats (comma-separated)",
+        value_delimiter = ','
+    )]
+    pub exclude_lang: Vec<String>,
 
-    #[arg(long)]
+    #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+
+    #[arg(short = 'o', long, help = "Write output to file instead of stdout")]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, help = "Restrict to specific repos (repeatable)")]
     pub repo: Option<Vec<String>>,
 
-    /// Group table output by language, author, or period
-    #[arg(long, value_enum, default_value_t = GroupBy::Language)]
+    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
     pub group: GroupBy,
 
-    /// Show data from last N days (can be fractional, e.g. 0.5 for 12 hours). Mutually exclusive with --since.
-    #[arg(long, conflicts_with = "since")]
+    #[arg(
+        short = 'd',
+        long,
+        help = "Show data from last N days (can be fractional, e.g. 0.5 for 12 hours)",
+        conflicts_with = "since"
+    )]
     pub days: Option<f64>,
 
     #[arg(long, value_enum, default_value_t = EmailDisplay::None, default_missing_value = "simple", num_args = 0..=1)]
     pub show_email: EmailDisplay,
 
-    #[arg(long, value_enum, default_value_t = DedupMode::Name)]
+    #[arg(long, value_enum, default_value_t = DedupMode::Name, help = "Author deduplication mode")]
     pub dedup: DedupMode,
 
     /// Filter commits by identity expression.
@@ -81,16 +97,16 @@ pub struct StatsArgs {
     #[arg(long)]
     pub me: Option<String>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Sort by column")]
     pub sort: Option<SortBy>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
     pub short: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help = "Show language details inline under each group")]
     pub inline_tree: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help = "Use compact single-line format for changes")]
     pub compact: bool,
 }
 
@@ -114,6 +130,7 @@ pub enum GroupBy {
     Language,
     Author,
     Period,
+    Repo,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -145,18 +162,22 @@ pub enum OutputFormat {
 pub struct GithubArgs {
     pub username: String,
 
-    #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
-    pub export: ExportFormat,
+    #[arg(short = 'f', long, value_enum, default_value_t = ExportFormat::Json)]
+    pub format: ExportFormat,
 
-    #[arg(long)]
-    pub svg_out: Option<PathBuf>,
+    #[arg(short = 'o', long, help = "Write output to file instead of stdout")]
+    pub output: Option<PathBuf>,
 
     #[arg(long, help = "Only show stats since this date (YYYY-MM-DD)")]
     pub since: Option<String>,
 
+    #[arg(long, help = "Only show stats until this date (YYYY-MM-DD)")]
+    pub until: Option<String>,
+
     #[arg(
+        short = 'd',
         long,
-        help = "Show stats for the last N days (can be decimal)",
+        help = "Show stats for the last N days (can be fractional, e.g. 0.5 for 12 hours)",
         conflicts_with = "since"
     )]
     pub days: Option<f64>,
@@ -167,11 +188,36 @@ pub struct GithubArgs {
     #[arg(long, help = "Include forked repos")]
     pub include_forks: bool,
 
-    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by")]
+    #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
+    pub include_contributed: bool,
+
+    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
     pub group: GroupBy,
+
+    #[arg(long, help = "Bypass disk cache (no read, no write)")]
+    pub no_cache: bool,
+
+    #[arg(
+        long,
+        help = "Read cached data and fetch incremental updates, then write back"
+    )]
+    pub refresh_cache: bool,
 
     #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
     pub short: bool,
+
+    #[arg(long, help = "Use compact single-line format for changes")]
+    pub compact: bool,
+
+    #[arg(long, help = "Show language details inline under each group")]
+    pub inline_tree: bool,
+
+    #[arg(
+        long,
+        help = "Exclude languages from stats (comma-separated)",
+        value_delimiter = ','
+    )]
+    pub exclude_lang: Vec<String>,
 
     #[arg(long, value_enum, help = "Sort by column")]
     pub sort: Option<SortBy>,

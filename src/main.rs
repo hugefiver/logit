@@ -22,7 +22,17 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 
-use cli::{Cli, Commands, OutputFormat, Period, ScanArgs, ScanFormat, StatsArgs};
+use cli::{Cli, Commands, GroupBy, OutputFormat, Period, ScanArgs, ScanFormat, StatsArgs};
+
+fn write_output(content: String, path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    if let Some(path) = path {
+        std::fs::write(path, &content)?;
+        eprintln!("Output written to: {}", path.display());
+    } else {
+        println!("{content}");
+    }
+    Ok(())
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -36,11 +46,11 @@ fn main() -> anyhow::Result<()> {
 
 fn cmd_scan(args: ScanArgs) -> anyhow::Result<()> {
     let repos = scanner::scan_for_repos(&args.path)?;
-    match args.output {
-        ScanFormat::Table => output::table::print_scan(&repos),
-        ScanFormat::Json => output::json::print_scan_json(&repos)?,
-    }
-    Ok(())
+    let content = match args.format {
+        ScanFormat::Table => output::table::render_scan_table(&repos),
+        ScanFormat::Json => output::json::render_scan_json(&repos)?,
+    };
+    write_output(content, args.output.as_deref())
 }
 
 fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
@@ -89,13 +99,30 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     let author_filter = args.author.as_deref();
     let lang_filter = args.lang.as_deref();
 
-    let period_stats =
-        stats::aggregator::aggregate_commits(&commits, &period, author_filter, lang_filter);
-    let totals = stats::aggregator::aggregate_totals(&period_stats);
+    let mut period_stats = if matches!(args.group, GroupBy::Repo) {
+        stats::aggregator::aggregate_by_repo(&commits, author_filter, lang_filter)
+    } else {
+        stats::aggregator::aggregate_commits(&commits, &period, author_filter, lang_filter)
+    };
+    let mut totals = stats::aggregator::aggregate_totals(&period_stats);
 
-    match args.output {
-        OutputFormat::Table => output::table::print_stats(&period_stats, &totals, &args.group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), args.short, args.compact, args.inline_tree),
-        OutputFormat::Json => output::json::print_stats_json(&period_stats, &totals)?,
+    if !args.exclude_lang.is_empty() {
+        stats::aggregator::filter_excluded_languages(
+            &mut period_stats,
+            &mut totals,
+            &args.exclude_lang,
+        );
+    }
+
+    match args.format {
+        OutputFormat::Table => {
+            let content = output::table::render_stats_table(&period_stats, &totals, &args.group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), args.short, args.compact, args.inline_tree);
+            write_output(content, args.output.as_deref())?;
+        }
+        OutputFormat::Json => {
+            let content = output::json::render_stats_json(&period_stats, &totals)?;
+            write_output(content, args.output.as_deref())?;
+        }
         #[cfg(feature = "tui")]
         OutputFormat::Tui => output::tui::run_tui(&period_stats, &totals)?,
     }
@@ -176,6 +203,9 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
     use cli::ExportFormat;
 
     let client = github::GithubClient::new()?;
+    if !client.has_token() {
+        anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
+    }
     let user = client.get_user(&args.username)?;
 
     let since_ts = if let Some(days) = args.days {
@@ -187,14 +217,45 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
         None
     };
 
-    let contributions =
-        github::api::fetch_user_stats(&client, &args.username, args.include_forks, since_ts)?;
+    let until_ts = args
+        .until
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .map(|dt| dt.timestamp());
+
+    let read_cache = !args.no_cache;
+    let write_cache = args.refresh_cache;
+
+    let contributions = github::api::fetch_user_stats(
+        &client,
+        &user.node_id,
+        &args.username,
+        args.include_forks,
+        args.include_contributed,
+        since_ts,
+        until_ts,
+        read_cache,
+        write_cache,
+    )?;
 
     let period = args.period.unwrap_or(Period::Month);
-    let period_stats = github::api::contributions_to_period_stats(&contributions, &period);
-    let totals = stats::aggregator::aggregate_totals(&period_stats);
+    let mut period_stats = if matches!(args.group, GroupBy::Repo) {
+        github::api::contributions_to_repo_stats(&contributions)
+    } else {
+        github::api::contributions_to_period_stats(&contributions, &period)
+    };
+    let mut totals = stats::aggregator::aggregate_totals(&period_stats);
 
-    match args.export {
+    if !args.exclude_lang.is_empty() {
+        stats::aggregator::filter_excluded_languages(
+            &mut period_stats,
+            &mut totals,
+            &args.exclude_lang,
+        );
+    }
+
+    match args.format {
         ExportFormat::Json => {
             let json = serde_json::json!({
                 "user": user,
@@ -206,13 +267,14 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
                     "by_language": totals.by_language,
                 }
             });
-            println!("{}", serde_json::to_string_pretty(&json)?);
+            let content = serde_json::to_string_pretty(&json)?;
+            write_output(content, args.output.as_deref())?;
         }
         ExportFormat::Table => {
             let dedup = cli::DedupMode::None;
             let email = cli::EmailDisplay::None;
             let identity_map = HashMap::new();
-            output::table::print_stats(
+            let content = output::table::render_stats_table(
                 &period_stats,
                 &totals,
                 &args.group,
@@ -221,18 +283,14 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
                 &identity_map,
                 args.sort.as_ref(),
                 args.short,
-                false,
-                false,
+                args.compact,
+                args.inline_tree,
             );
+            write_output(content, args.output.as_deref())?;
         }
         ExportFormat::Svg => {
             let svg = github::render_profile_card(&args.username, &user, Some(&totals))?;
-            if let Some(path) = args.svg_out {
-                std::fs::write(&path, &svg)?;
-                eprintln!("SVG written to: {}", path.display());
-            } else {
-                println!("{svg}");
-            }
+            write_output(svg, args.output.as_deref())?;
         }
     }
 

@@ -18,16 +18,6 @@ pub fn render_scan_json(repos: &[PathBuf]) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&output)?)
 }
 
-pub fn print_stats_json(stats: &[PeriodStats], totals: &PeriodStats) -> anyhow::Result<()> {
-    println!("{}", render_stats_json(stats, totals)?);
-    Ok(())
-}
-
-pub fn print_scan_json(repos: &[PathBuf]) -> anyhow::Result<()> {
-    println!("{}", render_scan_json(repos)?);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
