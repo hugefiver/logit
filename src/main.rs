@@ -543,13 +543,25 @@ fn fetch_github_data(
 #[cfg(feature = "github")]
 fn parse_period(s: &str) -> anyhow::Result<f64> {
     let s = s.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "week" | "w" => return Ok(7.0),
+        "month" | "m" => return Ok(30.0),
+        "quarter" | "q" => return Ok(90.0),
+        "half" | "h" => return Ok(180.0),
+        "year" | "y" => return Ok(365.0),
+        _ => {}
+    }
     let num_str = s.trim_end_matches(['d', 'D']);
     if num_str.is_empty() {
-        anyhow::bail!("Invalid period '{s}'. Expected format: 2d, 7d, 30d");
+        anyhow::bail!(
+            "Invalid period '{s}'. Expected: week, month, quarter, year, or Nd (e.g. 7d, 30d)"
+        );
     }
-    num_str
-        .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("Invalid period '{s}'. Expected format: 2d, 7d, 30d"))
+    num_str.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid period '{s}'. Expected: week, month, quarter, year, or Nd (e.g. 7d, 30d)"
+        )
+    })
 }
 
 #[cfg(feature = "github")]
