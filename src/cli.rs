@@ -14,7 +14,8 @@ pub enum Commands {
     Scan(ScanArgs),
     Stats(StatsArgs),
     #[cfg(feature = "github")]
-    Github(GithubArgs),
+    #[command(subcommand)]
+    Github(GithubSubcommand),
 }
 
 #[derive(clap::Args)]
@@ -159,14 +160,9 @@ pub enum OutputFormat {
 
 #[cfg(feature = "github")]
 #[derive(clap::Args)]
-pub struct GithubArgs {
+pub struct GithubDataArgs {
+    /// GitHub username
     pub username: String,
-
-    #[arg(short = 'f', long, value_enum, default_value_t = ExportFormat::Json)]
-    pub format: ExportFormat,
-
-    #[arg(short = 'o', long, help = "Write output to file instead of stdout")]
-    pub output: Option<PathBuf>,
 
     #[arg(long, help = "Only show stats since this date (YYYY-MM-DD)")]
     pub since: Option<String>,
@@ -177,22 +173,16 @@ pub struct GithubArgs {
     #[arg(
         short = 'd',
         long,
-        help = "Show stats for the last N days (can be fractional, e.g. 0.5 for 12 hours)",
+        help = "Show stats for the last N days",
         conflicts_with = "since"
     )]
     pub days: Option<f64>,
-
-    #[arg(long, value_enum, help = "Period granularity for stats")]
-    pub period: Option<Period>,
 
     #[arg(long, help = "Include forked repos")]
     pub include_forks: bool,
 
     #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
     pub include_contributed: bool,
-
-    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
-    pub group: GroupBy,
 
     #[arg(long, help = "Bypass disk cache (no read, no write)")]
     pub no_cache: bool,
@@ -202,6 +192,36 @@ pub struct GithubArgs {
         help = "Read cached data and fetch incremental updates, then write back"
     )]
     pub refresh_cache: bool,
+}
+
+#[cfg(feature = "github")]
+#[derive(Subcommand)]
+pub enum GithubSubcommand {
+    /// Fetch GitHub user stats and export as JSON or table
+    Fetch(GithubFetchArgs),
+    /// Generate SVG profile card
+    Card(GithubCardArgs),
+    /// Generate multi-period comparison SVG card
+    Multi(GithubMultiArgs),
+}
+
+#[cfg(feature = "github")]
+#[derive(clap::Args)]
+pub struct GithubFetchArgs {
+    #[command(flatten)]
+    pub data: GithubDataArgs,
+
+    #[arg(short = 'f', long, value_enum, default_value_t = FetchFormat::Json)]
+    pub format: FetchFormat,
+
+    #[arg(short = 'o', long, help = "Write output to file instead of stdout")]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, value_enum, help = "Period granularity for stats")]
+    pub period: Option<Period>,
+
+    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
+    pub group: GroupBy,
 
     #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
     pub short: bool,
@@ -225,10 +245,108 @@ pub struct GithubArgs {
 
 #[cfg(feature = "github")]
 #[derive(Clone, ValueEnum)]
-pub enum ExportFormat {
+pub enum FetchFormat {
     Json,
-    Svg,
     Table,
+}
+
+#[cfg(feature = "github")]
+#[derive(clap::Args)]
+pub struct GithubCardArgs {
+    /// GitHub username (fetch data live). Mutually exclusive with --input.
+    pub username: Option<String>,
+
+    /// Load data from previously exported JSON file instead of fetching
+    #[arg(short = 'i', long)]
+    pub input: Option<PathBuf>,
+
+    // Data-fetching options (only used when username is provided, ignored with --input):
+    #[arg(long, help = "Only show stats since this date (YYYY-MM-DD)")]
+    pub since: Option<String>,
+
+    #[arg(long, help = "Only show stats until this date (YYYY-MM-DD)")]
+    pub until: Option<String>,
+
+    #[arg(
+        short = 'd',
+        long,
+        help = "Show stats for the last N days",
+        conflicts_with = "since"
+    )]
+    pub days: Option<f64>,
+
+    #[arg(long, help = "Include forked repos")]
+    pub include_forks: bool,
+
+    #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
+    pub include_contributed: bool,
+
+    #[arg(long, help = "Bypass disk cache (no read, no write)")]
+    pub no_cache: bool,
+
+    #[arg(long, help = "Read cached data and fetch incremental updates")]
+    pub refresh_cache: bool,
+
+    // SVG-specific options:
+    #[arg(long, help = "Custom title for the SVG card")]
+    pub title: Option<String>,
+
+    #[arg(long, help = "Use short mode (2 columns, fewer stats)")]
+    pub short: bool,
+
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Number of language rows in legend (default: 2)"
+    )]
+    pub lang_rows: usize,
+
+    #[arg(
+        long,
+        help = "Exclude languages from stats (comma-separated)",
+        value_delimiter = ','
+    )]
+    pub exclude_lang: Vec<String>,
+
+    #[arg(short = 'o', long, help = "Write SVG to file instead of stdout")]
+    pub output: Option<PathBuf>,
+}
+
+#[cfg(feature = "github")]
+#[derive(clap::Args)]
+pub struct GithubMultiArgs {
+    pub username: String,
+
+    #[arg(
+        short = 'p',
+        long,
+        value_delimiter = ',',
+        required = true,
+        help = "Time periods to compare (e.g. 2d,7d,30d)"
+    )]
+    pub periods: Vec<String>,
+
+    #[arg(long, help = "Include forked repos")]
+    pub include_forks: bool,
+
+    #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
+    pub include_contributed: bool,
+
+    #[arg(long, help = "Bypass disk cache (no read, no write)")]
+    pub no_cache: bool,
+
+    #[arg(long, help = "Read cached data and fetch incremental updates")]
+    pub refresh_cache: bool,
+
+    #[arg(
+        long,
+        help = "Exclude languages from stats (comma-separated)",
+        value_delimiter = ','
+    )]
+    pub exclude_lang: Vec<String>,
+
+    #[arg(short = 'o', long, help = "Write SVG to file instead of stdout")]
+    pub output: Option<PathBuf>,
 }
 
 #[cfg(test)]

@@ -50,6 +50,9 @@ query($login: String!, $from: DateTime!, $to: DateTime!) {
   rateLimit { cost remaining resetAt }
   user(login: $login) {
     contributionsCollection(from: $from, to: $to) {
+      totalPullRequestContributions
+      totalPullRequestReviewContributions
+      totalIssueContributions
       commitContributionsByRepository(maxRepositories: 100) {
         repository {
           name
@@ -237,10 +240,11 @@ impl GithubClient {
         until: Option<i64>,
         include_forks: bool,
         include_contributed: bool,
-    ) -> anyhow::Result<Vec<(RepoWithLangs, u64)>> {
+    ) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
         let now = effective_window_end(until);
         let windows = contribution_windows(since, now);
         let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
+        let mut total_summary = ContributionSummary::default();
 
         for (from, to) in windows {
             let variables = serde_json::json!({
@@ -249,7 +253,10 @@ impl GithubClient {
                 "to": to.to_rfc3339(),
             });
             let data = self.graphql_query(CONTRIBUTIONS_QUERY, &variables)?;
-            let repos = parse_contributions_collection_data(data, username)?;
+            let (repos, summary) = parse_contributions_collection_data(data, username)?;
+            total_summary.total_prs += summary.total_prs;
+            total_summary.total_reviews += summary.total_reviews;
+            total_summary.total_issues += summary.total_issues;
 
             for (repo, commit_count) in repos {
                 let key = repo_key(&repo.owner, &repo.name);
@@ -281,7 +288,7 @@ impl GithubClient {
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
-        Ok(repos)
+        Ok((repos, total_summary))
     }
 
     pub fn batch_commit_history(
@@ -488,6 +495,13 @@ pub struct RepoContribution {
     pub languages: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContributionSummary {
+    pub total_prs: u64,
+    pub total_reviews: u64,
+    pub total_issues: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoWithLangs {
     pub owner: String,
@@ -619,6 +633,12 @@ struct GraphqlContributionsUser {
 struct GraphqlContributionsCollection {
     #[serde(rename = "commitContributionsByRepository")]
     commit_contributions_by_repository: Vec<GraphqlContributionByRepository>,
+    #[serde(rename = "totalPullRequestContributions", default)]
+    total_pull_request_contributions: u64,
+    #[serde(rename = "totalPullRequestReviewContributions", default)]
+    total_pull_request_review_contributions: u64,
+    #[serde(rename = "totalIssueContributions", default)]
+    total_issue_contributions: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -755,7 +775,7 @@ fn graphql_repo_node_to_repo_with_langs(node: GraphqlRepoNode) -> RepoWithLangs 
 fn parse_contributions_collection_data(
     data: serde_json::Value,
     username: &str,
-) -> anyhow::Result<Vec<(RepoWithLangs, u64)>> {
+) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
     let response: GraphqlContributionsData =
         serde_json::from_value(data).context("failed to parse GraphQL contributions data")?;
 
@@ -763,9 +783,20 @@ fn parse_contributions_collection_data(
         .user
         .with_context(|| format!("GitHub user '{username}' not found."))?;
 
-    Ok(user
-        .contributions_collection
-        .commit_contributions_by_repository
+    let GraphqlContributionsCollection {
+        commit_contributions_by_repository,
+        total_pull_request_contributions,
+        total_pull_request_review_contributions,
+        total_issue_contributions,
+    } = user.contributions_collection;
+
+    let summary = ContributionSummary {
+        total_prs: total_pull_request_contributions,
+        total_reviews: total_pull_request_review_contributions,
+        total_issues: total_issue_contributions,
+    };
+
+    let repos = commit_contributions_by_repository
         .into_iter()
         .map(|entry| {
             (
@@ -773,7 +804,9 @@ fn parse_contributions_collection_data(
                 entry.contributions.total_count,
             )
         })
-        .collect())
+        .collect();
+
+    Ok((repos, summary))
 }
 
 fn parse_batch_history_data(
@@ -959,11 +992,12 @@ fn get_contribution_repos_cached(
     include_contributed: bool,
     read_cache: bool,
     write_cache: bool,
-) -> anyhow::Result<Vec<(RepoWithLangs, u64)>> {
+) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
     let now = effective_window_end(until);
     let today = Utc::now().date_naive();
     let windows = contribution_windows(since, now);
     let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
+    let mut accumulated_summary = ContributionSummary::default();
 
     for (from, to) in windows {
         let key = format!(
@@ -983,8 +1017,8 @@ fn get_contribution_repos_cached(
             None
         };
 
-        let repos_chunk: Vec<(RepoWithLangs, u64)> = if let Some(cached) = cached {
-            cached
+        let (repos_chunk, summary_chunk): (Vec<(RepoWithLangs, u64)>, ContributionSummary) = if let Some(cached) = cached {
+            (cached, ContributionSummary::default())
         } else {
             let variables = serde_json::json!({
                 "login": username,
@@ -994,10 +1028,14 @@ fn get_contribution_repos_cached(
             let data = client.graphql_query(CONTRIBUTIONS_QUERY, &variables)?;
             let parsed = parse_contributions_collection_data(data, username)?;
             if write_cache {
-                let _ = cache.set(&key, &parsed);
+                let _ = cache.set(&key, &parsed.0);
             }
             parsed
         };
+
+        accumulated_summary.total_prs += summary_chunk.total_prs;
+        accumulated_summary.total_reviews += summary_chunk.total_reviews;
+        accumulated_summary.total_issues += summary_chunk.total_issues;
 
         for (repo, commit_count) in repos_chunk {
             let repo_id = repo_key(&repo.owner, &repo.name);
@@ -1027,7 +1065,7 @@ fn get_contribution_repos_cached(
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    Ok(repo_rows)
+    Ok((repo_rows, accumulated_summary))
 }
 
 #[allow(dead_code)]
@@ -1042,7 +1080,7 @@ pub fn fetch_user_stats(
     until: Option<i64>,
     read_cache: bool,
     write_cache: bool,
-) -> anyhow::Result<Vec<RepoContribution>> {
+) -> anyhow::Result<(Vec<RepoContribution>, ContributionSummary)> {
     let cache = if read_cache || write_cache {
         DiskCache::new().ok()
     } else {
@@ -1050,7 +1088,7 @@ pub fn fetch_user_stats(
     };
     let now = effective_window_end(until);
 
-    let repo_rows = if let Some(cache) = cache.as_ref() {
+    let (repo_rows, contribution_summary) = if let Some(cache) = cache.as_ref() {
         get_contribution_repos_cached(
             client,
             cache,
@@ -1147,7 +1185,7 @@ pub fn fetch_user_stats(
             "to": gap_until,
         });
         if let Ok(data) = client.graphql_query(CONTRIBUTIONS_QUERY, &variables)
-            && let Ok(active) = parse_contributions_collection_data(data, username)
+            && let Ok((active, _)) = parse_contributions_collection_data(data, username)
         {
                 let active_keys: std::collections::HashSet<String> = active
                     .iter()
@@ -1275,7 +1313,7 @@ pub fn fetch_user_stats(
         });
     }
 
-    Ok(contributions)
+    Ok((contributions, contribution_summary))
 }
 
 pub fn contributions_to_period_stats(
@@ -1681,6 +1719,9 @@ mod tests {
         let data = json!({
             "user": {
                 "contributionsCollection": {
+                    "totalPullRequestContributions": 9,
+                    "totalPullRequestReviewContributions": 14,
+                    "totalIssueContributions": 3,
                     "commitContributionsByRepository": [
                         {
                             "repository": {
@@ -1710,8 +1751,11 @@ mod tests {
             }
         });
 
-        let repos = parse_contributions_collection_data(data, "octocat").unwrap();
+        let (repos, summary) = parse_contributions_collection_data(data, "octocat").unwrap();
         assert_eq!(repos.len(), 2);
+        assert_eq!(summary.total_prs, 9);
+        assert_eq!(summary.total_reviews, 14);
+        assert_eq!(summary.total_issues, 3);
 
         assert_eq!(repos[0].0.owner, "octocat");
         assert_eq!(repos[0].0.name, "repo-a");

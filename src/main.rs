@@ -40,7 +40,11 @@ fn main() -> anyhow::Result<()> {
         Commands::Scan(args) => cmd_scan(args),
         Commands::Stats(args) => cmd_stats(args),
         #[cfg(feature = "github")]
-        Commands::Github(args) => cmd_github(args),
+        Commands::Github(sub) => match sub {
+            cli::GithubSubcommand::Fetch(args) => cmd_github_fetch(args),
+            cli::GithubSubcommand::Card(args) => cmd_github_card(args),
+            cli::GithubSubcommand::Multi(args) => cmd_github_multi(args),
+        },
     }
 }
 
@@ -199,44 +203,18 @@ fn build_remote_identity_map(
 }
 
 #[cfg(feature = "github")]
-fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
-    use cli::ExportFormat;
+fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
+    use cli::FetchFormat;
 
-    let client = github::GithubClient::new()?;
-    if !client.has_token() {
-        anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
-    }
-    let user = client.get_user(&args.username)?;
-
-    let since_ts = if let Some(days) = args.days {
-        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
-        Some((Utc::now() - duration).timestamp())
-    } else if let Some(ref since_str) = args.since {
-        Some(parse_date(since_str)?.timestamp())
-    } else {
-        None
-    };
-
-    let until_ts = args
-        .until
-        .as_deref()
-        .map(parse_date)
-        .transpose()?
-        .map(|dt| dt.timestamp());
-
-    let read_cache = !args.no_cache;
-    let write_cache = args.refresh_cache;
-
-    let contributions = github::api::fetch_user_stats(
-        &client,
-        &user.node_id,
-        &args.username,
-        args.include_forks,
-        args.include_contributed,
-        since_ts,
-        until_ts,
-        read_cache,
-        write_cache,
+    let (user, contributions, contribution_summary, days_value) = fetch_github_data(
+        &args.data.username,
+        args.data.days,
+        args.data.since.as_deref(),
+        args.data.until.as_deref(),
+        args.data.include_forks,
+        args.data.include_contributed,
+        args.data.no_cache,
+        args.data.refresh_cache,
     )?;
 
     let period = args.period.unwrap_or(Period::Month);
@@ -256,8 +234,14 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
     }
 
     match args.format {
-        ExportFormat::Json => {
+        FetchFormat::Json => {
             let json = serde_json::json!({
+                "metadata": {
+                    "username": args.data.username,
+                    "days": days_value,
+                    "active_repos": contributions.len(),
+                    "generated_at": chrono::Utc::now().to_rfc3339(),
+                },
                 "user": user,
                 "periods": period_stats,
                 "totals": {
@@ -265,12 +249,13 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
                     "total_additions": totals.total_additions,
                     "total_deletions": totals.total_deletions,
                     "by_language": totals.by_language,
-                }
+                },
+                "summary": contribution_summary,
             });
             let content = serde_json::to_string_pretty(&json)?;
             write_output(content, args.output.as_deref())?;
         }
-        ExportFormat::Table => {
+        FetchFormat::Table => {
             let dedup = cli::DedupMode::None;
             let email = cli::EmailDisplay::None;
             let identity_map = HashMap::new();
@@ -288,11 +273,274 @@ fn cmd_github(args: cli::GithubArgs) -> anyhow::Result<()> {
             );
             write_output(content, args.output.as_deref())?;
         }
-        ExportFormat::Svg => {
-            let svg = github::render_profile_card(&args.username, &user, Some(&totals))?;
-            write_output(svg, args.output.as_deref())?;
-        }
     }
 
     Ok(())
+}
+
+#[cfg(feature = "github")]
+fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
+    if args.username.is_none() && args.input.is_none() {
+        anyhow::bail!("Either provide a username or use --input to load from JSON file");
+    }
+    if args.username.is_some() && args.input.is_some() {
+        anyhow::bail!("Use either a username or --input, not both");
+    }
+
+    let (user, mut totals, summary, active_repos, days_value, username) =
+        if let Some(ref input_path) = args.input {
+            load_card_data_from_json(input_path)?
+        } else {
+            let username = args
+                .username
+                .as_deref()
+                .expect("username is required when --input is not provided");
+
+            let (user, contributions, contribution_summary, days_value) = fetch_github_data(
+                username,
+                args.days,
+                args.since.as_deref(),
+                args.until.as_deref(),
+                args.include_forks,
+                args.include_contributed,
+                args.no_cache,
+                args.refresh_cache,
+            )?;
+
+            let period_stats = github::api::contributions_to_period_stats(&contributions, &Period::Month);
+            let totals = stats::aggregator::aggregate_totals(&period_stats);
+
+            (
+                user,
+                totals,
+                contribution_summary,
+                contributions.len(),
+                days_value,
+                username.to_string(),
+            )
+        };
+
+    if !args.exclude_lang.is_empty() {
+        for lang in &args.exclude_lang {
+            totals
+                .by_language
+                .retain(|name, _| !name.eq_ignore_ascii_case(lang));
+        }
+    }
+
+    let svg = github::render_profile_card(
+        &username,
+        &user,
+        Some(&totals),
+        active_repos,
+        &summary,
+        days_value,
+        args.short,
+        args.lang_rows,
+        args.title.as_deref(),
+    )?;
+    write_output(svg, args.output.as_deref())
+}
+
+#[cfg(feature = "github")]
+fn load_card_data_from_json(
+    path: &std::path::Path,
+) -> anyhow::Result<(
+    github::api::GithubUser,
+    stats::models::PeriodStats,
+    github::ContributionSummary,
+    usize,
+    u64,
+    String,
+)> {
+    let content = std::fs::read_to_string(path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+
+    let user: github::api::GithubUser = serde_json::from_value(
+        json.get("user")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'user' in JSON"))?
+            .clone(),
+    )?;
+
+    let metadata = json.get("metadata");
+    let days = metadata
+        .and_then(|m| m.get("days"))
+        .and_then(|d| d.as_u64())
+        .unwrap_or(365);
+    let active_repos = metadata
+        .and_then(|m| m.get("active_repos"))
+        .and_then(|a| a.as_u64())
+        .unwrap_or(0) as usize;
+    let username = metadata
+        .and_then(|m| m.get("username"))
+        .and_then(|u| u.as_str())
+        .unwrap_or(&user.login)
+        .to_string();
+
+    let summary: github::ContributionSummary = json
+        .get("summary")
+        .map(|summary| serde_json::from_value(summary.clone()))
+        .transpose()?
+        .unwrap_or_default();
+
+    let totals_json = json
+        .get("totals")
+        .ok_or_else(|| anyhow::anyhow!("Missing 'totals' in JSON"))?;
+    let totals = stats::models::PeriodStats {
+        period_label: "Total".to_string(),
+        total_commits: totals_json
+            .get("total_commits")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        total_additions: totals_json
+            .get("total_additions")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        total_deletions: totals_json
+            .get("total_deletions")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        by_language: totals_json
+            .get("by_language")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default(),
+        by_author: HashMap::new(),
+    };
+
+    Ok((user, totals, summary, active_repos, days, username))
+}
+
+#[cfg(feature = "github")]
+#[allow(clippy::too_many_arguments)]
+fn fetch_github_data(
+    username: &str,
+    days: Option<f64>,
+    since: Option<&str>,
+    until: Option<&str>,
+    include_forks: bool,
+    include_contributed: bool,
+    no_cache: bool,
+    refresh_cache: bool,
+) -> anyhow::Result<(
+    github::api::GithubUser,
+    Vec<github::api::RepoContribution>,
+    github::ContributionSummary,
+    u64,
+)> {
+    let client = github::GithubClient::new()?;
+    if !client.has_token() {
+        anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
+    }
+
+    let user = client.get_user(username)?;
+
+    let since_ts = if let Some(days) = days {
+        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
+        Some((Utc::now() - duration).timestamp())
+    } else if let Some(since_str) = since {
+        Some(parse_date(since_str)?.timestamp())
+    } else {
+        None
+    };
+
+    let until_ts = until
+        .map(parse_date)
+        .transpose()?
+        .map(|date| date.timestamp());
+
+    let read_cache = !no_cache;
+    let write_cache = refresh_cache;
+
+    let (contributions, contribution_summary) = github::api::fetch_user_stats(
+        &client,
+        &user.node_id,
+        username,
+        include_forks,
+        include_contributed,
+        since_ts,
+        until_ts,
+        read_cache,
+        write_cache,
+    )?;
+
+    let days_value = if let Some(days) = days {
+        days.ceil() as u64
+    } else if let Some(since_str) = since {
+        let since_dt = parse_date(since_str)?;
+        let diff = Utc::now() - since_dt;
+        diff.num_days().max(1) as u64
+    } else {
+        365
+    };
+
+    Ok((user, contributions, contribution_summary, days_value))
+}
+
+#[cfg(feature = "github")]
+fn parse_period(s: &str) -> anyhow::Result<f64> {
+    let s = s.trim();
+    let num_str = s.trim_end_matches(['d', 'D']);
+    if num_str.is_empty() {
+        anyhow::bail!("Invalid period '{s}'. Expected format: 2d, 7d, 30d");
+    }
+    num_str
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("Invalid period '{s}'. Expected format: 2d, 7d, 30d"))
+}
+
+#[cfg(feature = "github")]
+fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
+    let client = github::GithubClient::new()?;
+    if !client.has_token() {
+        anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
+    }
+
+    let user = client.get_user(&args.username)?;
+    let read_cache = !args.no_cache;
+    let write_cache = args.refresh_cache;
+
+    let mut columns = Vec::new();
+    for period_str in &args.periods {
+        let days = parse_period(period_str)?;
+        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
+        let since_ts = Some((Utc::now() - duration).timestamp());
+
+        let (contributions, _summary) = github::api::fetch_user_stats(
+            &client,
+            &user.node_id,
+            &args.username,
+            args.include_forks,
+            args.include_contributed,
+            since_ts,
+            None,
+            read_cache,
+            write_cache,
+        )?;
+
+        let period_stats =
+            github::api::contributions_to_period_stats(&contributions, &Period::Month);
+        let mut totals = stats::aggregator::aggregate_totals(&period_stats);
+
+        if !args.exclude_lang.is_empty() {
+            for lang in &args.exclude_lang {
+                totals
+                    .by_language
+                    .retain(|name, _| !name.eq_ignore_ascii_case(lang));
+            }
+        }
+
+        if contributions.is_empty() {
+            continue;
+        }
+
+        columns.push(github::MultiColumnData {
+            days: days.ceil() as u64,
+            stats: totals,
+            active_repos: contributions.len(),
+        });
+    }
+
+    let svg = github::render_multi_card(&columns)?;
+    write_output(svg, args.output.as_deref())
 }
