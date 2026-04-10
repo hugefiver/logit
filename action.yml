@@ -1,0 +1,89 @@
+name: 'Logit GitHub Card'
+description: 'Generate SVG profile cards from GitHub contribution statistics'
+
+branding:
+  icon: 'bar-chart-2'
+  color: 'blue'
+
+inputs:
+  username:
+    description: 'GitHub username'
+    required: true
+  token:
+    description: 'GitHub token (PAT with read access)'
+    default: ${{ github.token }}
+  command:
+    description: 'card or multi'
+    default: 'card'
+  days:
+    description: 'Number of days to look back (card only)'
+    default: '365'
+  periods:
+    description: 'Comma-separated periods for multi command (e.g. week,month,year)'
+    default: 'week,month,year'
+  include-forks:
+    description: 'Include forked repositories'
+    default: 'false'
+  include-contributed:
+    description: 'Include contributed repositories'
+    default: 'false'
+  exclude-lang:
+    description: 'Comma-separated languages to exclude'
+    default: ''
+  short:
+    description: 'Use compact card layout (card only)'
+    default: 'false'
+  lang-rows:
+    description: 'Number of language rows (card only)'
+    default: '2'
+  title:
+    description: 'Custom card title (card only)'
+    default: ''
+  output:
+    description: 'Output SVG file path'
+    default: 'profile-card.svg'
+
+outputs:
+  svg-path:
+    description: 'Path to the generated SVG file'
+    value: ${{ inputs.output }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: actions/cache@v5
+      id: cache-logit
+      with:
+        path: ~/.cargo/bin/logit
+        key: logit-${{ runner.os }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path)) }}
+
+    - name: Install logit
+      if: steps.cache-logit.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --path "${{ github.action_path }}" --features github
+
+    - name: Generate SVG
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        CMD="logit github ${{ inputs.command }}"
+
+        if [ "${{ inputs.command }}" = "multi" ]; then
+          CMD="$CMD ${{ inputs.username }} -p ${{ inputs.periods }}"
+        else
+          CMD="$CMD ${{ inputs.username }} -d ${{ inputs.days }}"
+          if [ "${{ inputs.short }}" = "true" ]; then CMD="$CMD --short"; fi
+          if [ -n "${{ inputs.lang-rows }}" ]; then CMD="$CMD --lang-rows ${{ inputs.lang-rows }}"; fi
+          if [ -n "${{ inputs.title }}" ]; then CMD="$CMD --title '${{ inputs.title }}'"; fi
+        fi
+
+        if [ "${{ inputs.include-forks }}" = "true" ]; then CMD="$CMD --include-forks"; fi
+        if [ "${{ inputs.include-contributed }}" = "true" ]; then CMD="$CMD --include-contributed"; fi
+        if [ -n "${{ inputs.exclude-lang }}" ]; then CMD="$CMD --exclude-lang ${{ inputs.exclude-lang }}"; fi
+
+        CMD="$CMD -o ${{ inputs.output }}"
+        echo "Running: $CMD"
+        eval $CMD
