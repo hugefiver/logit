@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Utc};
 
-use crate::cli::Period;
-use crate::stats::models::{AuthorStats, CommitStats, LangStats, PeriodStats};
+use crate::cli::{GroupBy, Period};
+use crate::stats::models::{AuthorStats, CommitStats, GroupNode, LangStats, PeriodStats};
 
 /// Bucket a timestamp into a period label string.
 /// - Day: "2024-01-15"
@@ -49,6 +49,16 @@ pub fn aggregate_by_repo(
 ) -> Vec<PeriodStats> {
     aggregate_commits_with_bucket_key(commits, author_filter, lang_filter, |commit| {
         commit.repo.clone()
+    })
+}
+
+pub fn aggregate_by_author(
+    commits: &[CommitStats],
+    author_filter: Option<&str>,
+    lang_filter: Option<&str>,
+) -> Vec<PeriodStats> {
+    aggregate_commits_with_bucket_key(commits, author_filter, lang_filter, |commit| {
+        format!("{} <{}>", commit.author.name, commit.author.email)
     })
 }
 
@@ -249,6 +259,157 @@ pub fn aggregate_totals(period_stats: &[PeriodStats]) -> PeriodStats {
     }
 
     total
+}
+
+fn group_key(commit: &CommitStats, group: &GroupBy, period: &Period) -> String {
+    match group {
+        GroupBy::Repo => commit.repo.clone(),
+        GroupBy::Author => format!("{} <{}>", commit.author.name, commit.author.email),
+        GroupBy::Period => bucket_timestamp(&commit.timestamp, period),
+        GroupBy::Language => unreachable!("Language is not a tree-level partition"),
+    }
+}
+
+pub fn effective_groups(
+    commits: &[CommitStats],
+    groups: &[GroupBy],
+    period: &Period,
+) -> Vec<GroupBy> {
+    if groups.len() <= 1 {
+        return groups.to_vec();
+    }
+    let filtered: Vec<GroupBy> = groups
+        .iter()
+        .filter(|g| {
+            if matches!(g, GroupBy::Language) {
+                return true;
+            }
+            let unique: HashSet<String> =
+                commits.iter().map(|c| group_key(c, g, period)).collect();
+            unique.len() > 1
+        })
+        .copied()
+        .collect();
+
+    if filtered.is_empty() {
+        vec![*groups.last().unwrap()]
+    } else {
+        filtered
+    }
+}
+
+pub fn validate_groups(groups: &[GroupBy]) -> Result<(), String> {
+    if groups.len() <= 1 {
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    for g in groups {
+        if !seen.insert(g) {
+            return Err(format!("Duplicate --group level: {:?}", g));
+        }
+    }
+    for (i, g) in groups.iter().enumerate() {
+        if matches!(g, GroupBy::Language) && i < groups.len() - 1 {
+            return Err(
+                "Language can only be the last --group level (one commit spans multiple languages)"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn build_group_tree(
+    commits: &[CommitStats],
+    groups: &[GroupBy],
+    period: &Period,
+    author_filter: Option<&str>,
+    lang_filter: Option<&str>,
+) -> Vec<GroupNode> {
+    if groups.is_empty() {
+        return vec![];
+    }
+    let mut nodes = build_group_tree_inner(commits, groups, period, author_filter, lang_filter);
+    prune_empty_nodes(&mut nodes);
+    nodes
+}
+
+fn build_group_tree_inner(
+    commits: &[CommitStats],
+    groups: &[GroupBy],
+    period: &Period,
+    author_filter: Option<&str>,
+    lang_filter: Option<&str>,
+) -> Vec<GroupNode> {
+    let current_group = &groups[0];
+    let remaining = &groups[1..];
+
+    if remaining.is_empty() {
+        let rows = match current_group {
+            GroupBy::Repo => aggregate_by_repo(commits, author_filter, lang_filter),
+            GroupBy::Author => aggregate_by_author(commits, author_filter, lang_filter),
+            GroupBy::Period | GroupBy::Language => {
+                aggregate_commits(commits, period, author_filter, lang_filter)
+            }
+        };
+        return rows
+            .into_iter()
+            .map(|s| GroupNode {
+                label: s.period_label.clone(),
+                stats: s,
+                children: vec![],
+            })
+            .collect();
+    }
+
+    let mut partitions: HashMap<String, Vec<CommitStats>> = HashMap::new();
+    for commit in commits {
+        let key = group_key(commit, current_group, period);
+        partitions.entry(key).or_default().push(commit.clone());
+    }
+
+    let mut nodes: Vec<GroupNode> = partitions
+        .into_iter()
+        .map(|(key, partition_commits)| {
+            let children = build_group_tree_inner(
+                &partition_commits,
+                remaining,
+                period,
+                author_filter,
+                lang_filter,
+            );
+            let child_stats: Vec<PeriodStats> =
+                children.iter().map(|c| c.stats.clone()).collect();
+            let stats = aggregate_totals(&child_stats);
+            GroupNode {
+                label: key,
+                stats,
+                children,
+            }
+        })
+        .collect();
+
+    nodes.sort_by(|a, b| a.label.cmp(&b.label));
+    nodes
+}
+
+fn prune_empty_nodes(nodes: &mut Vec<GroupNode>) {
+    for node in nodes.iter_mut() {
+        prune_empty_nodes(&mut node.children);
+    }
+    nodes.retain(|n| n.stats.total_commits > 0);
+}
+
+pub fn filter_excluded_languages_tree(nodes: &mut [GroupNode], excluded: &[String]) {
+    if excluded.is_empty() {
+        return;
+    }
+    for node in nodes.iter_mut() {
+        remove_excluded_from_period(&mut node.stats, excluded);
+        if !node.children.is_empty() {
+            filter_excluded_languages_tree(&mut node.children, excluded);
+        }
+    }
 }
 
 #[cfg(test)]

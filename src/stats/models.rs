@@ -60,6 +60,18 @@ pub struct PeriodStats {
     pub total_deletions: u64,
 }
 
+/// A node in a multi-level grouping tree.
+///
+/// Leaf nodes have empty `children` and `stats` contains the data for that
+/// single bucket. Non-leaf nodes have children and `stats` is the aggregated
+/// total across all descendants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupNode {
+    pub label: String,
+    pub stats: PeriodStats,
+    pub children: Vec<GroupNode>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LangStats {
     pub additions: u64,

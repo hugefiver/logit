@@ -70,16 +70,31 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
         .map(parse_date)
         .transpose()?;
 
-    let repos: Vec<PathBuf> = if args.path.join(".git").exists() {
-        vec![args.path.clone()]
-    } else {
-        scanner::scan_for_repos(&args.path)?
-    };
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for path in &args.paths {
+        if path.join(".git").exists() {
+            repos.push(path.clone());
+        } else {
+            repos.extend(scanner::scan_for_repos(path)?);
+        }
+    }
 
     let (commits, errors) = analyze::analyze_repos(&repos, since, until);
 
     for e in &errors {
         eprintln!("Warning: failed to analyze {}: {}", e.path.display(), e.error);
+    }
+
+    if commits.is_empty() {
+        eprintln!("No commits found in the given period.");
+        return Ok(());
+    }
+
+    let active_repos: std::collections::HashSet<&str> =
+        commits.iter().map(|c| c.repo.as_str()).collect();
+    let skipped = repos.len() - active_repos.len();
+    if skipped > 0 {
+        eprintln!("Skipped {skipped} repo(s) with no activity in the period.");
     }
 
     let identity_map = build_identity_map(&args.dedup, &repos, &commits);
@@ -103,32 +118,74 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     let author_filter = args.author.as_deref();
     let lang_filter = args.lang.as_deref();
 
-    let mut period_stats = if matches!(args.group, GroupBy::Repo) {
-        stats::aggregator::aggregate_by_repo(&commits, author_filter, lang_filter)
-    } else {
-        stats::aggregator::aggregate_commits(&commits, &period, author_filter, lang_filter)
-    };
-    let mut totals = stats::aggregator::aggregate_totals(&period_stats);
-
-    if !args.exclude_lang.is_empty() {
-        stats::aggregator::filter_excluded_languages(
-            &mut period_stats,
-            &mut totals,
-            &args.exclude_lang,
-        );
+    if let Err(e) = stats::aggregator::validate_groups(&args.group) {
+        anyhow::bail!(e);
     }
 
-    match args.format {
-        OutputFormat::Table => {
-            let content = output::table::render_stats_table(&period_stats, &totals, &args.group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), args.short, args.compact, args.inline_tree);
-            write_output(content, args.output.as_deref())?;
+    let effective = stats::aggregator::effective_groups(&commits, &args.group, &period);
+    let use_tree = effective.len() > 1;
+
+    if use_tree {
+        let mut nodes = stats::aggregator::build_group_tree(
+            &commits, &effective, &period, author_filter, lang_filter,
+        );
+
+        if !args.exclude_lang.is_empty() {
+            stats::aggregator::filter_excluded_languages_tree(&mut nodes, &args.exclude_lang);
         }
-        OutputFormat::Json => {
-            let content = output::json::render_stats_json(&period_stats, &totals)?;
-            write_output(content, args.output.as_deref())?;
+
+        match args.format {
+            OutputFormat::Table => {
+                let leaf_group = effective.last().copied().unwrap_or(GroupBy::Language);
+                let content = output::table::render_group_tree(
+                    &nodes,
+                    &leaf_group,
+                    args.sort.as_ref(),
+                    args.short,
+                    args.compact,
+                    args.inline_tree,
+                );
+                write_output(content, args.output.as_deref())?;
+            }
+            OutputFormat::Json => {
+                let content = serde_json::to_string_pretty(&nodes)?;
+                write_output(content, args.output.as_deref())?;
+            }
+            #[cfg(feature = "tui")]
+            OutputFormat::Tui => {
+                eprintln!("TUI mode does not support multi-group trees yet");
+            }
         }
-        #[cfg(feature = "tui")]
-        OutputFormat::Tui => output::tui::run_tui(&period_stats, &totals)?,
+    } else {
+        let group = effective.first().copied().unwrap_or(GroupBy::Language);
+
+        let mut period_stats = if matches!(group, GroupBy::Repo) {
+            stats::aggregator::aggregate_by_repo(&commits, author_filter, lang_filter)
+        } else {
+            stats::aggregator::aggregate_commits(&commits, &period, author_filter, lang_filter)
+        };
+        let mut totals = stats::aggregator::aggregate_totals(&period_stats);
+
+        if !args.exclude_lang.is_empty() {
+            stats::aggregator::filter_excluded_languages(
+                &mut period_stats,
+                &mut totals,
+                &args.exclude_lang,
+            );
+        }
+
+        match args.format {
+            OutputFormat::Table => {
+                let content = output::table::render_stats_table(&period_stats, &totals, &group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), args.short, args.compact, args.inline_tree);
+                write_output(content, args.output.as_deref())?;
+            }
+            OutputFormat::Json => {
+                let content = output::json::render_stats_json(&period_stats, &totals)?;
+                write_output(content, args.output.as_deref())?;
+            }
+            #[cfg(feature = "tui")]
+            OutputFormat::Tui => output::tui::run_tui(&period_stats, &totals)?,
+        }
     }
 
     Ok(())
@@ -218,7 +275,13 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
     )?;
 
     let period = args.period.unwrap_or(Period::Month);
-    let mut period_stats = if matches!(args.group, GroupBy::Repo) {
+
+    if let Err(e) = stats::aggregator::validate_groups(&args.group) {
+        anyhow::bail!(e);
+    }
+
+    let group = args.group.first().copied().unwrap_or(GroupBy::Language);
+    let mut period_stats = if matches!(group, GroupBy::Repo) {
         github::api::contributions_to_repo_stats(&contributions)
     } else {
         github::api::contributions_to_period_stats(&contributions, &period)
@@ -262,7 +325,7 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
             let content = output::table::render_stats_table(
                 &period_stats,
                 &totals,
-                &args.group,
+                &group,
                 &email,
                 &dedup,
                 &identity_map,

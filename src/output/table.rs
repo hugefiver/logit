@@ -7,7 +7,7 @@ use colored::Colorize;
 use comfy_table::{CellAlignment, ContentArrangement, Table};
 
 use crate::cli::{DedupMode, EmailDisplay, GroupBy, SortBy};
-use crate::stats::models::PeriodStats;
+use crate::stats::models::{GroupNode, PeriodStats};
 
 const LINE_WIDTH: usize = 81;
 const NAME_WIDTH: usize = 20;
@@ -788,6 +788,103 @@ pub fn render_stats_table(
         GroupBy::Period => render_period_table(stats, totals, sort, short, compact, inline_tree),
         GroupBy::Repo => render_period_table(stats, totals, sort, short, compact, inline_tree),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_group_tree(
+    nodes: &[GroupNode],
+    leaf_group: &GroupBy,
+    sort: Option<&SortBy>,
+    short: bool,
+    compact: bool,
+    inline_tree: bool,
+) -> String {
+    render_group_tree_inner(
+        nodes,
+        leaf_group,
+        sort,
+        short,
+        compact,
+        inline_tree,
+        0,
+    )
+}
+
+fn render_group_tree_inner(
+    nodes: &[GroupNode],
+    leaf_group: &GroupBy,
+    sort: Option<&SortBy>,
+    short: bool,
+    compact: bool,
+    inline_tree: bool,
+    depth: usize,
+) -> String {
+    if nodes.is_empty() {
+        return "No data to display".to_string();
+    }
+
+    let all_leaves = nodes.iter().all(|n| n.children.is_empty());
+
+    if all_leaves {
+        let rows: Vec<PeriodStats> = nodes.iter().map(|n| n.stats.clone()).collect();
+        let totals = crate::stats::aggregator::aggregate_totals(&rows);
+        return match leaf_group {
+            GroupBy::Language => render_language_table(&rows, &totals, sort, short, compact),
+            GroupBy::Author | GroupBy::Period | GroupBy::Repo => {
+                render_period_table(&rows, &totals, sort, short, compact, inline_tree)
+            }
+        };
+    }
+
+    let mut out = String::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if i > 0 && !compact {
+            out.push('\n');
+        }
+
+        let indent = "  ".repeat(depth);
+        let add_str = format!("+{}", format_num(node.stats.total_additions, short));
+        let del_str = format!("-{}", format_num(node.stats.total_deletions, short));
+        let _ = writeln!(
+            out,
+            "\n{}━━ {} ({} commits, {}/{})",
+            indent,
+            node.label.bright_blue().bold(),
+            node.stats.total_commits,
+            add_str.green(),
+            del_str.red(),
+        );
+
+        let child_out = render_group_tree_inner(
+            &node.children,
+            leaf_group,
+            sort,
+            short,
+            compact,
+            inline_tree,
+            depth + 1,
+        );
+        out.push_str(&child_out);
+    }
+
+    if depth == 0 {
+        let grand_total = crate::stats::aggregator::aggregate_totals(
+            &nodes.iter().map(|n| n.stats.clone()).collect::<Vec<_>>(),
+        );
+        let add_str = format!("+{}", format_num(grand_total.total_additions, short));
+        let del_str = format!("-{}", format_num(grand_total.total_deletions, short));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", "━".repeat(LINE_WIDTH));
+        let _ = writeln!(
+            out,
+            "  Grand Total: {} commits, {}/{}",
+            grand_total.total_commits,
+            add_str.green(),
+            del_str.red(),
+        );
+    }
+
+    out
 }
 
 pub fn render_scan_table(repos: &[PathBuf]) -> String {

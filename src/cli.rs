@@ -37,8 +37,8 @@ pub enum ScanFormat {
 
 #[derive(clap::Args)]
 pub struct StatsArgs {
-    #[arg(long, default_value = ".")]
-    pub path: PathBuf,
+    #[arg(default_value = ".")]
+    pub paths: Vec<PathBuf>,
 
     #[arg(long, help = "Filter by author name or email")]
     pub author: Option<String>,
@@ -74,8 +74,14 @@ pub struct StatsArgs {
     #[arg(long, help = "Restrict to specific repos (repeatable)")]
     pub repo: Option<Vec<String>>,
 
-    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
-    pub group: GroupBy,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "language",
+        help = "Group stats by language, author, period, or repo (comma-separated for multi-level, e.g. repo,author,period)"
+    )]
+    pub group: Vec<GroupBy>,
 
     #[arg(
         short = 'd',
@@ -126,7 +132,7 @@ pub enum EmailDisplay {
     Full,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum GroupBy {
     Language,
     Author,
@@ -220,8 +226,14 @@ pub struct GithubFetchArgs {
     #[arg(long, value_enum, help = "Period granularity for stats")]
     pub period: Option<Period>,
 
-    #[arg(long, value_enum, default_value_t = GroupBy::Language, help = "Group stats by language, author, period, or repo")]
-    pub group: GroupBy,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "language",
+        help = "Group stats by language, author, period, or repo (comma-separated for multi-level, e.g. repo,author,period)"
+    )]
+    pub group: Vec<GroupBy>,
 
     #[arg(long, help = "Use short number format (1.2k, 3.4M)")]
     pub short: bool,
