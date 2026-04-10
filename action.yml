@@ -59,6 +59,11 @@ runs:
         path: ~/.cargo/bin/logit
         key: logit-${{ runner.os }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path)) }}
 
+    - uses: actions/cache@v5
+      with:
+        path: ~/.cache/logit/github/
+        key: logit-data-${{ inputs.username }}-${{ inputs.command }}-${{ inputs.days }}
+
     - name: Install logit
       if: steps.cache-logit.outputs.cache-hit != 'true'
       shell: bash
