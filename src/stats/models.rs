@@ -42,6 +42,14 @@ pub struct FileChange {
     pub language: Option<String>,
     pub additions: u64,
     pub deletions: u64,
+    /// `max(additions, deletions)` — counts each same-line change as one modification,
+    /// plus any purely-added or purely-deleted lines.
+    #[serde(default)]
+    pub net_modifications: u64,
+    /// `additions.saturating_sub(deletions)` — only the truly new lines,
+    /// excluding deletions and same-line replacements.
+    #[serde(default)]
+    pub net_additions: u64,
 }
 
 impl fmt::Display for FileChange {
@@ -58,6 +66,14 @@ pub struct PeriodStats {
     pub total_commits: u64,
     pub total_additions: u64,
     pub total_deletions: u64,
+    /// Local path: computed per-file then summed. GitHub path: computed per-commit then summed.
+    /// Neither equals per-hunk computation; GitHub lacks hunk-level data.
+    #[serde(default)]
+    pub total_net_modifications: u64,
+    /// Local path: `Σ file.additions.saturating_sub(file.deletions)`.
+    /// GitHub path: `Σ commit.additions.saturating_sub(commit.deletions)`.
+    #[serde(default)]
+    pub total_net_additions: u64,
 }
 
 /// A node in a multi-level grouping tree.
@@ -77,6 +93,10 @@ pub struct LangStats {
     pub additions: u64,
     pub deletions: u64,
     pub files_changed: u64,
+    #[serde(default)]
+    pub net_modifications: u64,
+    #[serde(default)]
+    pub net_additions: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -88,6 +108,18 @@ pub struct AuthorStats {
     pub deletions: u64,
     pub co_authored_deletions: u64,
     pub languages: HashMap<String, LangStats>,
+    /// Per-language breakdown of co-authored contributions only.
+    /// Used to correctly split authored vs co-authored when excluding languages.
+    #[serde(default)]
+    pub co_authored_languages: HashMap<String, LangStats>,
+    #[serde(default)]
+    pub net_modifications: u64,
+    #[serde(default)]
+    pub co_authored_net_modifications: u64,
+    #[serde(default)]
+    pub net_additions: u64,
+    #[serde(default)]
+    pub co_authored_net_additions: u64,
 }
 
 #[cfg(test)]
@@ -154,6 +186,8 @@ mod tests {
             language: Some("Rust".to_string()),
             additions: 10,
             deletions: 3,
+            net_modifications: 10,
+            net_additions: 7,
         };
         assert_eq!(format!("{fc}"), "src/main.rs (+10/-3)");
     }
@@ -182,6 +216,8 @@ mod tests {
                 language: Some("Rust".to_string()),
                 additions: 50,
                 deletions: 10,
+                net_modifications: 50,
+                net_additions: 40,
             }],
         };
 
@@ -210,6 +246,7 @@ mod tests {
                 additions: 100,
                 deletions: 20,
                 files_changed: 5,
+                ..Default::default()
             },
         );
 
@@ -220,6 +257,7 @@ mod tests {
                 additions: 100,
                 deletions: 20,
                 files_changed: 5,
+                ..Default::default()
             },
         );
 
@@ -234,6 +272,7 @@ mod tests {
                 additions: 100,
                 deletions: 20,
                 languages: author_languages,
+                ..Default::default()
             },
         );
 
@@ -244,6 +283,8 @@ mod tests {
             total_commits: 10,
             total_additions: 100,
             total_deletions: 20,
+            total_net_modifications: 100,
+            total_net_additions: 80,
         };
 
         let json = serde_json::to_string(&period).unwrap();

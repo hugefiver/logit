@@ -75,12 +75,16 @@ mod tests {
                 language: None,
                 additions: 10,
                 deletions: 0,
+                net_modifications: 10,
+                net_additions: 10,
             },
             FileChange {
                 path: "lib.py".to_string(),
                 language: None,
                 additions: 5,
                 deletions: 2,
+                net_modifications: 5,
+                net_additions: 3,
             },
         ];
         apply_language_to_changes(&mut changes);

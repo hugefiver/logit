@@ -33,6 +33,8 @@ mod tests {
                 additions: 12,
                 deletions: 3,
                 files_changed: 2,
+                net_modifications: 12,
+                net_additions: 9,
             },
         );
 
@@ -46,7 +48,12 @@ mod tests {
                 co_authored_additions: 0,
                 deletions: 3,
                 co_authored_deletions: 0,
+                net_modifications: 12,
+                co_authored_net_modifications: 0,
+                net_additions: 9,
+                co_authored_net_additions: 0,
                 languages: by_language.clone(),
+                co_authored_languages: HashMap::new(),
             },
         );
 
@@ -57,6 +64,8 @@ mod tests {
             total_commits: 4,
             total_additions: 12,
             total_deletions: 3,
+            total_net_modifications: 12,
+            total_net_additions: 9,
         }
     }
 

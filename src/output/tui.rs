@@ -373,6 +373,7 @@ mod tests {
                     additions: adds,
                     deletions: dels,
                     files_changed: 1,
+                    ..Default::default()
                 },
             );
         }
@@ -383,6 +384,8 @@ mod tests {
             total_commits: commits,
             total_additions: adds,
             total_deletions: dels,
+            total_net_modifications: adds.max(dels),
+            total_net_additions: adds.saturating_sub(dels),
         }
     }
 
@@ -394,6 +397,8 @@ mod tests {
                 additions: 200,
                 deletions: 50,
                 files_changed: 5,
+                net_modifications: 200,
+                net_additions: 150,
             },
         );
         by_language.insert(
@@ -402,6 +407,8 @@ mod tests {
                 additions: 100,
                 deletions: 30,
                 files_changed: 3,
+                net_modifications: 100,
+                net_additions: 70,
             },
         );
         PeriodStats {
@@ -411,6 +418,8 @@ mod tests {
             total_commits: 10,
             total_additions: 300,
             total_deletions: 80,
+            total_net_modifications: 300,
+            total_net_additions: 220,
         }
     }
 
@@ -472,6 +481,8 @@ mod tests {
                 additions: 200,
                 deletions: 10,
                 files_changed: 3,
+                net_modifications: 200,
+                net_additions: 190,
             },
         );
         by_language.insert(
@@ -480,6 +491,8 @@ mod tests {
                 additions: 50,
                 deletions: 5,
                 files_changed: 1,
+                net_modifications: 50,
+                net_additions: 45,
             },
         );
         let period = PeriodStats {
@@ -489,6 +502,8 @@ mod tests {
             total_commits: 5,
             total_additions: 250,
             total_deletions: 15,
+            total_net_modifications: 250,
+            total_net_additions: 235,
         };
         assert_eq!(top_language(&period), "Rust");
     }
@@ -502,6 +517,8 @@ mod tests {
             total_commits: 0,
             total_additions: 0,
             total_deletions: 0,
+            total_net_modifications: 0,
+            total_net_additions: 0,
         };
         assert_eq!(top_language(&period), "—");
     }

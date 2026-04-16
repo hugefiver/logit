@@ -906,10 +906,14 @@ fn commits_to_weekly_buckets(commits: &[CommitData]) -> Vec<ContributorWeek> {
             a: 0,
             d: 0,
             c: 0,
+            net_modifications: 0,
+            net_additions: 0,
         });
         bucket.a += commit.additions;
         bucket.d += commit.deletions;
         bucket.c += 1;
+        bucket.net_modifications += commit.additions.max(commit.deletions);
+        bucket.net_additions += commit.additions.saturating_sub(commit.deletions);
     }
 
     let mut weeks: Vec<ContributorWeek> = buckets.into_values().collect();
@@ -1280,6 +1284,46 @@ pub fn fetch_user_stats(
     Ok((contributions, contribution_summary))
 }
 
+/// Distribute `total` among buckets proportional to `shares` using
+/// largest-remainder (Hamilton) apportionment so the parts sum exactly to `total`.
+fn apportion(total: u64, shares: &[f64]) -> Vec<u64> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let share_sum: f64 = shares.iter().sum();
+    if share_sum == 0.0 {
+        let mut result = vec![0u64; shares.len()];
+        // Give everything to the first bucket to preserve the total
+        result[0] = total;
+        return result;
+    }
+
+    let total_f = total as f64;
+    let quotas: Vec<f64> = shares.iter().map(|s| total_f * s / share_sum).collect();
+    let mut floors: Vec<u64> = quotas.iter().map(|q| *q as u64).collect();
+    let floor_sum: u64 = floors.iter().sum();
+    let mut remainder = total.saturating_sub(floor_sum);
+
+    if remainder > 0 {
+        // Sort indices by fractional part descending, tie-break by index ascending
+        let mut indices: Vec<usize> = (0..quotas.len()).collect();
+        indices.sort_by(|&a, &b| {
+            let fa = quotas[a] - (quotas[a] as u64) as f64;
+            let fb = quotas[b] - (quotas[b] as u64) as f64;
+            fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        });
+        for &idx in &indices {
+            if remainder == 0 {
+                break;
+            }
+            floors[idx] += 1;
+            remainder -= 1;
+        }
+    }
+
+    floors
+}
+
 pub fn contributions_to_period_stats(
     contributions: &[RepoContribution],
     period: &crate::cli::Period,
@@ -1307,27 +1351,40 @@ pub fn contributions_to_period_stats(
                 total_commits: 0,
                 total_additions: 0,
                 total_deletions: 0,
+                total_net_modifications: 0,
+                total_net_additions: 0,
             });
 
             entry.total_commits += week.c;
             entry.total_additions += week.a;
             entry.total_deletions += week.d;
+            entry.total_net_modifications += week.net_modifications;
+            entry.total_net_additions += week.net_additions;
 
             if lang_total_bytes > 0 {
-                for (lang, &bytes) in &contrib.languages {
-                    let ratio = bytes as f64 / lang_total_bytes as f64;
-                    let lang_adds = (week.a as f64 * ratio).round() as u64;
-                    let lang_dels = (week.d as f64 * ratio).round() as u64;
+                let mut langs: Vec<(&String, &u64)> = contrib.languages.iter().collect();
+                langs.sort_by(|a, b| a.0.cmp(b.0));
+                let shares: Vec<f64> = langs.iter().map(|&(_, &b)| b as f64).collect();
 
-                    let lang_entry = entry.by_language.entry(lang.clone()).or_default();
-                    lang_entry.additions += lang_adds;
-                    lang_entry.deletions += lang_dels;
+                let a_parts = apportion(week.a, &shares);
+                let d_parts = apportion(week.d, &shares);
+                let nm_parts = apportion(week.net_modifications, &shares);
+                let na_parts = apportion(week.net_additions, &shares);
+
+                for (i, (lang, _)) in langs.iter().enumerate() {
+                    let lang_entry = entry.by_language.entry((*lang).clone()).or_default();
+                    lang_entry.additions += a_parts[i];
+                    lang_entry.deletions += d_parts[i];
+                    lang_entry.net_modifications += nm_parts[i];
+                    lang_entry.net_additions += na_parts[i];
                     lang_entry.files_changed += 1;
                 }
             } else if week.a > 0 || week.d > 0 {
                 let lang_entry = entry.by_language.entry("Other".to_string()).or_default();
                 lang_entry.additions += week.a;
                 lang_entry.deletions += week.d;
+                lang_entry.net_modifications += week.net_modifications;
+                lang_entry.net_additions += week.net_additions;
                 lang_entry.files_changed += 1;
             }
         }
@@ -1353,6 +1410,8 @@ pub fn contributions_to_repo_stats(contributions: &[RepoContribution]) -> Vec<cr
             total_commits: 0,
             total_additions: 0,
             total_deletions: 0,
+            total_net_modifications: 0,
+            total_net_additions: 0,
         };
 
         for week in &contrib.weeks {
@@ -1363,22 +1422,33 @@ pub fn contributions_to_repo_stats(contributions: &[RepoContribution]) -> Vec<cr
             entry.total_commits += week.c;
             entry.total_additions += week.a;
             entry.total_deletions += week.d;
+            entry.total_net_modifications += week.net_modifications;
+            entry.total_net_additions += week.net_additions;
 
             if lang_total_bytes > 0 {
-                for (lang, &bytes) in &contrib.languages {
-                    let ratio = bytes as f64 / lang_total_bytes as f64;
-                    let lang_adds = (week.a as f64 * ratio).round() as u64;
-                    let lang_dels = (week.d as f64 * ratio).round() as u64;
+                let mut langs: Vec<(&String, &u64)> = contrib.languages.iter().collect();
+                langs.sort_by(|a, b| a.0.cmp(b.0));
+                let shares: Vec<f64> = langs.iter().map(|&(_, &b)| b as f64).collect();
 
-                    let lang_entry = entry.by_language.entry(lang.clone()).or_default();
-                    lang_entry.additions += lang_adds;
-                    lang_entry.deletions += lang_dels;
+                let a_parts = apportion(week.a, &shares);
+                let d_parts = apportion(week.d, &shares);
+                let nm_parts = apportion(week.net_modifications, &shares);
+                let na_parts = apportion(week.net_additions, &shares);
+
+                for (i, (lang, _)) in langs.iter().enumerate() {
+                    let lang_entry = entry.by_language.entry((*lang).clone()).or_default();
+                    lang_entry.additions += a_parts[i];
+                    lang_entry.deletions += d_parts[i];
+                    lang_entry.net_modifications += nm_parts[i];
+                    lang_entry.net_additions += na_parts[i];
                     lang_entry.files_changed += 1;
                 }
             } else if week.a > 0 || week.d > 0 {
                 let lang_entry = entry.by_language.entry("Other".to_string()).or_default();
                 lang_entry.additions += week.a;
                 lang_entry.deletions += week.d;
+                lang_entry.net_modifications += week.net_modifications;
+                lang_entry.net_additions += week.net_additions;
                 lang_entry.files_changed += 1;
             }
         }
@@ -1430,6 +1500,12 @@ pub struct ContributorWeek {
     pub a: u64,
     pub d: u64,
     pub c: u64,
+    /// Pre-computed per-commit `max(additions, deletions)` summed across commits in this week.
+    #[serde(default)]
+    pub net_modifications: u64,
+    /// Pre-computed per-commit `additions.saturating_sub(deletions)` summed across commits.
+    #[serde(default)]
+    pub net_additions: u64,
 }
 
 #[cfg(test)]
@@ -1841,12 +1917,16 @@ mod tests {
                         a: 20,
                         d: 6,
                         c: 2,
+                        net_modifications: 20,
+                        net_additions: 14,
                     },
                     ContributorWeek {
                         w: Utc.with_ymd_and_hms(2025, 1, 13, 0, 0, 0).unwrap().timestamp(),
                         a: 15,
                         d: 5,
                         c: 1,
+                        net_modifications: 15,
+                        net_additions: 10,
                     },
                 ],
                 languages: HashMap::from([
@@ -1864,6 +1944,8 @@ mod tests {
                     a: 5,
                     d: 3,
                     c: 2,
+                    net_modifications: 5,
+                    net_additions: 2,
                 }],
                 languages: HashMap::new(),
             },
@@ -1883,8 +1965,14 @@ mod tests {
         // 70/30 split over total additions/deletions
         assert_eq!(stats[0].by_language["Rust"].additions, 25);
         assert_eq!(stats[0].by_language["Rust"].deletions, 8);
-        assert_eq!(stats[0].by_language["TypeScript"].additions, 11);
-        assert_eq!(stats[0].by_language["TypeScript"].deletions, 4);
+        assert_eq!(stats[0].by_language["TypeScript"].additions, 10);
+        assert_eq!(stats[0].by_language["TypeScript"].deletions, 3);
+        assert_eq!(stats[0].total_net_modifications, 35);
+        assert_eq!(stats[0].total_net_additions, 24);
+        assert_eq!(stats[0].by_language["Rust"].net_modifications, 25);
+        assert_eq!(stats[0].by_language["Rust"].net_additions, 17);
+        assert_eq!(stats[0].by_language["TypeScript"].net_modifications, 10);
+        assert_eq!(stats[0].by_language["TypeScript"].net_additions, 7);
 
         assert_eq!(stats[1].total_commits, 2);
         assert_eq!(stats[1].total_additions, 5);
@@ -1892,5 +1980,9 @@ mod tests {
         assert!(stats[1].by_author.is_empty());
         assert_eq!(stats[1].by_language["Other"].additions, 5);
         assert_eq!(stats[1].by_language["Other"].deletions, 3);
+        assert_eq!(stats[1].total_net_modifications, 5);
+        assert_eq!(stats[1].total_net_additions, 2);
+        assert_eq!(stats[1].by_language["Other"].net_modifications, 5);
+        assert_eq!(stats[1].by_language["Other"].net_additions, 2);
     }
 }

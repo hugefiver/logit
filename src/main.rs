@@ -313,6 +313,8 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
                     "total_commits": totals.total_commits,
                     "total_additions": totals.total_additions,
                     "total_deletions": totals.total_deletions,
+                    "total_net_modifications": totals.total_net_modifications,
+                    "total_net_additions": totals.total_net_additions,
                     "by_language": totals.by_language,
                 },
                 "summary": contribution_summary,
@@ -386,11 +388,7 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
         };
 
     if !args.exclude_lang.is_empty() {
-        for lang in &args.exclude_lang {
-            totals
-                .by_language
-                .retain(|name, _| !name.eq_ignore_ascii_case(lang));
-        }
+        stats::aggregator::remove_excluded_from_period(&mut totals, &args.exclude_lang);
     }
 
     let svg = github::render_profile_card(
@@ -464,6 +462,14 @@ fn load_card_data_from_json(
             .unwrap_or(0),
         total_deletions: totals_json
             .get("total_deletions")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        total_net_modifications: totals_json
+            .get("total_net_modifications")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        total_net_additions: totals_json
+            .get("total_net_additions")
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
         by_language: totals_json
@@ -601,11 +607,7 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
         let mut totals = stats::aggregator::aggregate_totals(&period_stats);
 
         if !args.exclude_lang.is_empty() {
-            for lang in &args.exclude_lang {
-                totals
-                    .by_language
-                    .retain(|name, _| !name.eq_ignore_ascii_case(lang));
-            }
+            stats::aggregator::remove_excluded_from_period(&mut totals, &args.exclude_lang);
         }
 
         if contributions.is_empty() {

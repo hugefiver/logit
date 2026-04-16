@@ -57,6 +57,8 @@ pub fn analyze_commit_diff(repo: &Repository, commit: &Commit) -> Result<Vec<Fil
             language: None,
             additions,
             deletions,
+            net_modifications: additions.max(deletions),
+            net_additions: additions.saturating_sub(deletions),
         })
         .collect();
 

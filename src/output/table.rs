@@ -948,6 +948,7 @@ mod tests {
                     additions: *add,
                     deletions: *del,
                     files_changed: *files,
+                    ..Default::default()
                 },
             );
         }
@@ -958,6 +959,8 @@ mod tests {
             total_commits: commits,
             total_additions: total_add,
             total_deletions: total_del,
+            total_net_modifications: 0,
+            total_net_additions: 0,
         }
     }
 
@@ -976,6 +979,7 @@ mod tests {
                         additions: a,
                         deletions: d,
                         files_changed: f,
+                        ..Default::default()
                     },
                 );
             }
@@ -989,6 +993,7 @@ mod tests {
                     deletions,
                     co_authored_deletions: 0,
                     languages,
+                    ..Default::default()
                 },
             );
         }

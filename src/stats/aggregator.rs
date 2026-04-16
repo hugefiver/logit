@@ -90,6 +90,8 @@ where
             total_commits: 0,
             total_additions: 0,
             total_deletions: 0,
+            total_net_modifications: 0,
+            total_net_additions: 0,
         });
 
         ps.total_commits += 1;
@@ -115,21 +117,29 @@ where
 
             ps.total_additions += fc.additions;
             ps.total_deletions += fc.deletions;
+            ps.total_net_modifications += fc.net_modifications;
+            ps.total_net_additions += fc.net_additions;
 
             let lang_entry = ps.by_language.entry(lang.clone()).or_default();
             lang_entry.additions += fc.additions;
             lang_entry.deletions += fc.deletions;
             lang_entry.files_changed += 1;
+            lang_entry.net_modifications += fc.net_modifications;
+            lang_entry.net_additions += fc.net_additions;
 
             {
                 let author_entry = ps.by_author.get_mut(&author_key).expect("just inserted");
                 author_entry.additions += fc.additions;
                 author_entry.deletions += fc.deletions;
+                author_entry.net_modifications += fc.net_modifications;
+                author_entry.net_additions += fc.net_additions;
 
                 let author_lang = author_entry.languages.entry(lang.clone()).or_default();
                 author_lang.additions += fc.additions;
                 author_lang.deletions += fc.deletions;
                 author_lang.files_changed += 1;
+                author_lang.net_modifications += fc.net_modifications;
+                author_lang.net_additions += fc.net_additions;
             }
 
             for co in &commit.co_authors {
@@ -137,11 +147,22 @@ where
                 let co_entry = ps.by_author.get_mut(&co_key).expect("just inserted");
                 co_entry.co_authored_additions += fc.additions;
                 co_entry.co_authored_deletions += fc.deletions;
+                co_entry.co_authored_net_modifications += fc.net_modifications;
+                co_entry.co_authored_net_additions += fc.net_additions;
 
                 let co_lang = co_entry.languages.entry(lang.clone()).or_default();
                 co_lang.additions += fc.additions;
                 co_lang.deletions += fc.deletions;
                 co_lang.files_changed += 1;
+                co_lang.net_modifications += fc.net_modifications;
+                co_lang.net_additions += fc.net_additions;
+
+                let co_lang2 = co_entry.co_authored_languages.entry(lang.clone()).or_default();
+                co_lang2.additions += fc.additions;
+                co_lang2.deletions += fc.deletions;
+                co_lang2.files_changed += 1;
+                co_lang2.net_modifications += fc.net_modifications;
+                co_lang2.net_additions += fc.net_additions;
             }
         }
     }
@@ -174,18 +195,56 @@ pub fn filter_excluded_languages(
     remove_excluded_from_period(totals, excluded);
 }
 
-fn remove_excluded_from_period(period: &mut PeriodStats, excluded: &[String]) {
+pub fn remove_excluded_from_period(period: &mut PeriodStats, excluded: &[String]) {
     for lang in excluded {
         if let Some(removed) = remove_language_case_insensitive(&mut period.by_language, lang) {
             period.total_additions = period.total_additions.saturating_sub(removed.additions);
             period.total_deletions = period.total_deletions.saturating_sub(removed.deletions);
+            period.total_net_modifications = period
+                .total_net_modifications
+                .saturating_sub(removed.net_modifications);
+            period.total_net_additions = period
+                .total_net_additions
+                .saturating_sub(removed.net_additions);
         }
 
         for author_stats in period.by_author.values_mut() {
             if let Some(removed) = remove_language_case_insensitive(&mut author_stats.languages, lang)
             {
-                author_stats.additions = author_stats.additions.saturating_sub(removed.additions);
-                author_stats.deletions = author_stats.deletions.saturating_sub(removed.deletions);
+                let co_removed = remove_language_case_insensitive(
+                    &mut author_stats.co_authored_languages,
+                    lang,
+                )
+                .unwrap_or_default();
+
+                let primary_adds = removed.additions.saturating_sub(co_removed.additions);
+                let primary_dels = removed.deletions.saturating_sub(co_removed.deletions);
+                let primary_net_mods =
+                    removed.net_modifications.saturating_sub(co_removed.net_modifications);
+                let primary_net_adds =
+                    removed.net_additions.saturating_sub(co_removed.net_additions);
+
+                author_stats.additions = author_stats.additions.saturating_sub(primary_adds);
+                author_stats.deletions = author_stats.deletions.saturating_sub(primary_dels);
+                author_stats.net_modifications = author_stats
+                    .net_modifications
+                    .saturating_sub(primary_net_mods);
+                author_stats.net_additions = author_stats
+                    .net_additions
+                    .saturating_sub(primary_net_adds);
+
+                author_stats.co_authored_additions = author_stats
+                    .co_authored_additions
+                    .saturating_sub(co_removed.additions);
+                author_stats.co_authored_deletions = author_stats
+                    .co_authored_deletions
+                    .saturating_sub(co_removed.deletions);
+                author_stats.co_authored_net_modifications = author_stats
+                    .co_authored_net_modifications
+                    .saturating_sub(co_removed.net_modifications);
+                author_stats.co_authored_net_additions = author_stats
+                    .co_authored_net_additions
+                    .saturating_sub(co_removed.net_additions);
             }
         }
     }
@@ -211,6 +270,8 @@ fn remove_language_case_insensitive(
             removed_total.additions += removed.additions;
             removed_total.deletions += removed.deletions;
             removed_total.files_changed += removed.files_changed;
+            removed_total.net_modifications += removed.net_modifications;
+            removed_total.net_additions += removed.net_additions;
         }
     }
 
@@ -226,18 +287,24 @@ pub fn aggregate_totals(period_stats: &[PeriodStats]) -> PeriodStats {
         total_commits: 0,
         total_additions: 0,
         total_deletions: 0,
+        total_net_modifications: 0,
+        total_net_additions: 0,
     };
 
     for ps in period_stats {
         total.total_commits += ps.total_commits;
         total.total_additions += ps.total_additions;
         total.total_deletions += ps.total_deletions;
+        total.total_net_modifications += ps.total_net_modifications;
+        total.total_net_additions += ps.total_net_additions;
 
         for (lang, ls) in &ps.by_language {
             let entry = total.by_language.entry(lang.clone()).or_default();
             entry.additions += ls.additions;
             entry.deletions += ls.deletions;
             entry.files_changed += ls.files_changed;
+            entry.net_modifications += ls.net_modifications;
+            entry.net_additions += ls.net_additions;
         }
 
         for (author_key, author_stats) in &ps.by_author {
@@ -248,12 +315,28 @@ pub fn aggregate_totals(period_stats: &[PeriodStats]) -> PeriodStats {
             entry.co_authored_additions += author_stats.co_authored_additions;
             entry.deletions += author_stats.deletions;
             entry.co_authored_deletions += author_stats.co_authored_deletions;
+            entry.net_modifications += author_stats.net_modifications;
+            entry.co_authored_net_modifications += author_stats.co_authored_net_modifications;
+            entry.net_additions += author_stats.net_additions;
+            entry.co_authored_net_additions += author_stats.co_authored_net_additions;
 
             for (lang, ls) in &author_stats.languages {
                 let lang_entry = entry.languages.entry(lang.clone()).or_default();
                 lang_entry.additions += ls.additions;
                 lang_entry.deletions += ls.deletions;
                 lang_entry.files_changed += ls.files_changed;
+                lang_entry.net_modifications += ls.net_modifications;
+                lang_entry.net_additions += ls.net_additions;
+            }
+
+            for (lang, ls) in &author_stats.co_authored_languages {
+                let lang_entry =
+                    entry.co_authored_languages.entry(lang.clone()).or_default();
+                lang_entry.additions += ls.additions;
+                lang_entry.deletions += ls.deletions;
+                lang_entry.files_changed += ls.files_changed;
+                lang_entry.net_modifications += ls.net_modifications;
+                lang_entry.net_additions += ls.net_additions;
             }
         }
     }
@@ -502,6 +585,8 @@ mod tests {
             language: Some("Rust".to_string()),
             additions: adds,
             deletions: dels,
+            net_modifications: adds.max(dels),
+            net_additions: adds.saturating_sub(dels),
         }
     }
 
@@ -511,6 +596,8 @@ mod tests {
             language: Some("Python".to_string()),
             additions: adds,
             deletions: dels,
+            net_modifications: adds.max(dels),
+            net_additions: adds.saturating_sub(dels),
         }
     }
 
@@ -520,6 +607,8 @@ mod tests {
             language: None,
             additions: adds,
             deletions: dels,
+            net_modifications: adds.max(dels),
+            net_additions: adds.saturating_sub(dels),
         }
     }
 
@@ -677,6 +766,50 @@ mod tests {
 
         assert_eq!(totals.by_author["Alice <alice@test.com>"].commits, 2);
         assert_eq!(totals.by_author["Alice <alice@test.com>"].additions, 38);
+    }
+
+    #[test]
+    fn aggregate_totals_merges_co_authored_languages() {
+        let bob = Author {
+            name: "Bob".to_string(),
+            email: "bob@test.com".to_string(),
+        };
+        let commits = vec![
+            make_commit(
+                "Alice",
+                "alice@test.com",
+                vec![bob.clone()],
+                Utc.with_ymd_and_hms(2024, 1, 10, 12, 0, 0).unwrap(),
+                vec![rust_file("src/a.rs", 10, 2)],
+            ),
+            make_commit(
+                "Alice",
+                "alice@test.com",
+                vec![bob.clone()],
+                Utc.with_ymd_and_hms(2024, 2, 10, 12, 0, 0).unwrap(),
+                vec![rust_file("src/b.rs", 20, 5)],
+            ),
+        ];
+
+        let periods = aggregate_commits(&commits, &Period::Month, None, None);
+        let totals = aggregate_totals(&periods);
+
+        // Bob appears as co-author across both periods
+        let bob_stats = &totals.by_author["Bob <bob@test.com>"];
+        assert_eq!(bob_stats.co_authored_additions, 30);
+        assert_eq!(bob_stats.co_authored_deletions, 7);
+
+        // co_authored_languages should be merged across periods
+        assert!(
+            bob_stats.co_authored_languages.contains_key("Rust"),
+            "co_authored_languages should contain Rust after merging"
+        );
+        let co_rust = &bob_stats.co_authored_languages["Rust"];
+        assert_eq!(co_rust.additions, 30);
+        assert_eq!(co_rust.deletions, 7);
+        assert_eq!(co_rust.files_changed, 2);
+        assert_eq!(co_rust.net_modifications, 30); // max(10,2) + max(20,5) = 10+20
+        assert_eq!(co_rust.net_additions, 23); // (10-2) + (20-5) = 8+15
     }
 
     #[test]
