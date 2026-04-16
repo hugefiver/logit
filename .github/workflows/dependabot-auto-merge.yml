@@ -1,6 +1,9 @@
 name: Auto-merge Dependabot PRs
 
-on: pull_request
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -9,10 +12,42 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.event == 'pull_request'
     steps:
-      - name: Enable auto-merge
-        run: gh pr merge --auto --rebase "$PR_URL"
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find PR for this branch
+        id: pr
+        run: |
+          PR=$(gh pr list --head "${{ github.event.workflow_run.head_branch }}" --json number -q '.[0].number')
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase, rewrite author, and merge
+        if: steps.pr.outputs.number != ''
+        run: |
+          git config user.name "Hugefiver"
+          git config user.email "i@iruri.moe"
+
+          git fetch origin "${{ github.event.workflow_run.head_branch }}"
+          git checkout -b pr-branch FETCH_HEAD
+
+          export GIT_COMMITTER_NAME="Hugefiver"
+          export GIT_COMMITTER_EMAIL="i@iruri.moe"
+          git rebase origin/master --exec 'git commit --amend --no-edit --reset-author'
+
+          git checkout master
+          git merge --ff-only pr-branch
+          git push origin master
+
+          gh pr close "${{ steps.pr.outputs.number }}" --comment "Auto-merged via rebase"
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
