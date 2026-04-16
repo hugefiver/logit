@@ -400,6 +400,7 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
         days_value,
         args.short,
         args.number_format,
+        args.number_format_lines,
         args.lang_rows,
         args.title.as_deref(),
     )?;
@@ -621,6 +622,6 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
         });
     }
 
-    let svg = github::render_multi_card(&columns, args.number_format)?;
+    let svg = github::render_multi_card(&columns, args.number_format, args.number_format_lines)?;
     write_output(svg, args.output.as_deref())
 }

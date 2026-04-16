@@ -112,6 +112,7 @@ pub fn render_profile_card(
     days: u64,
     short: bool,
     num_fmt: NumberFormat,
+    num_fmt_lines: Option<NumberFormat>,
     lang_rows: usize,
     custom_title: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -121,6 +122,7 @@ pub fn render_profile_card(
     let total_commits = stats.map_or(0, |s| s.total_commits);
     let total_additions = stats.map_or(0, |s| s.total_additions);
     let total_deletions = stats.map_or(0, |s| s.total_deletions);
+    let total_net_additions = stats.map_or(0, |s| s.total_net_additions);
 
     let card_width: usize = if short { 495 } else { 700 };
     let bar_width: usize = card_width - 50;
@@ -130,10 +132,12 @@ pub fn render_profile_card(
         total_commits,
         total_additions,
         total_deletions,
+        total_net_additions,
         active_repos,
         summary,
         short,
         num_fmt,
+        num_fmt_lines,
         card_width,
     );
 
@@ -175,6 +179,7 @@ pub fn render_profile_card(
 pub fn render_multi_card(
     data: &[MultiColumnData],
     num_fmt: NumberFormat,
+    num_fmt_lines: Option<NumberFormat>,
 ) -> anyhow::Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("multi", MULTI_TEMPLATE)?;
@@ -188,10 +193,12 @@ pub fn render_multi_card(
     let stat_row_spacing = 24usize;
     let value_x = 115usize;
 
-    let bar_y = 135usize;
+    let bar_y = 160usize;
     let legend_start_y = bar_y + 24;
     let lang_spacing = 20usize;
     let max_langs = 3usize;
+
+    let line_fmt = num_fmt_lines.unwrap_or(num_fmt);
 
     let mut columns: Vec<MultiColumn> = Vec::new();
 
@@ -203,6 +210,7 @@ pub fn render_multi_card(
         let total_commits = stats.total_commits;
         let total_additions = stats.total_additions;
         let total_deletions = stats.total_deletions;
+        let total_net_additions = stats.total_net_additions;
 
         let stat_items = vec![
             StatItem {
@@ -226,7 +234,7 @@ pub fn render_multi_card(
             StatItem {
                 icon: ICON_PLUS.to_string(),
                 label: "Added:".to_string(),
-                value: format!("+{}", format_num(total_additions, num_fmt)),
+                value: format!("+{}", format_num(total_additions, line_fmt)),
                 value_class: "stat-add".to_string(),
                 value_x,
                 x: stat_x,
@@ -235,11 +243,20 @@ pub fn render_multi_card(
             StatItem {
                 icon: ICON_MINUS.to_string(),
                 label: "Deleted:".to_string(),
-                value: format!("-{}", format_num(total_deletions, num_fmt)),
+                value: format!("-{}", format_num(total_deletions, line_fmt)),
                 value_class: "stat-del".to_string(),
                 value_x,
                 x: stat_x,
                 y: stat_row_start + 3 * stat_row_spacing,
+            },
+            StatItem {
+                icon: ICON_NET_CHANGE.to_string(),
+                label: "Net Adds:".to_string(),
+                value: format!("+{}", format_num(total_net_additions, line_fmt)),
+                value_class: "stat-add".to_string(),
+                value_x,
+                x: stat_x,
+                y: stat_row_start + 4 * stat_row_spacing,
             },
         ];
 
@@ -274,7 +291,7 @@ pub fn render_multi_card(
     let card_height = if has_any_langs {
         legend_start_y + (max_langs - 1) * lang_spacing + 15
     } else {
-        stat_row_start + 3 * stat_row_spacing + 15
+        stat_row_start + 4 * stat_row_spacing + 15
     };
 
     let mut ctx = Context::new();
@@ -349,10 +366,12 @@ fn build_stat_items(
     total_commits: u64,
     total_additions: u64,
     total_deletions: u64,
+    total_net_additions: u64,
     active_repos: usize,
     summary: &ContributionSummary,
     short: bool,
     num_fmt: NumberFormat,
+    num_fmt_lines: Option<NumberFormat>,
     card_width: usize,
 ) -> Vec<StatItem> {
     let mut items = Vec::new();
@@ -369,6 +388,7 @@ fn build_stat_items(
     let col_width = (card_width - 2 * margin) / if short { 2 } else { 3 };
     let col_x: [usize; 3] = [margin, margin + col_width, margin + 2 * col_width];
     let value_x: usize = 130;
+    let line_fmt = num_fmt_lines.unwrap_or(num_fmt);
 
     let mut push =
         |col: usize, row: usize, icon: &str, label: &str, value: String, value_class: &str| {
@@ -406,7 +426,7 @@ fn build_stat_items(
             1,
             ICON_PLUS,
             "Lines Added:",
-            format!("+{}", format_num(total_additions, num_fmt)),
+            format!("+{}", format_num(total_additions, line_fmt)),
             "stat-add",
         );
         push(
@@ -414,7 +434,7 @@ fn build_stat_items(
             1,
             ICON_MINUS,
             "Lines Deleted:",
-            format!("-{}", format_num(total_deletions, num_fmt)),
+            format!("-{}", format_num(total_deletions, line_fmt)),
             "stat-del",
         );
 
@@ -438,23 +458,7 @@ fn build_stat_items(
         return items;
     }
 
-    let (net_value, net_class) = if total_additions >= total_deletions {
-        (
-            format!(
-                "+{}",
-                format_num(total_additions - total_deletions, num_fmt)
-            ),
-            "stat-add",
-        )
-    } else {
-        (
-            format!(
-                "-{}",
-                format_num(total_deletions - total_additions, num_fmt)
-            ),
-            "stat-del",
-        )
-    };
+    let net_adds_value = format!("+{}", format_num(total_net_additions, line_fmt));
 
     push(
         0,
@@ -486,7 +490,7 @@ fn build_stat_items(
         1,
         ICON_PLUS,
         "Lines Added:",
-        format!("+{}", format_num(total_additions, num_fmt)),
+        format!("+{}", format_num(total_additions, line_fmt)),
         "stat-add",
     );
     push(
@@ -494,10 +498,17 @@ fn build_stat_items(
         1,
         ICON_MINUS,
         "Lines Deleted:",
-        format!("-{}", format_num(total_deletions, num_fmt)),
+        format!("-{}", format_num(total_deletions, line_fmt)),
         "stat-del",
     );
-    push(2, 1, ICON_NET_CHANGE, "Net Change:", net_value, net_class);
+    push(
+        2,
+        1,
+        ICON_NET_CHANGE,
+        "Net Adds:",
+        net_adds_value,
+        "stat-add",
+    );
 
     push(
         0,
@@ -615,6 +626,8 @@ mod tests {
                 additions: 500,
                 deletions: 100,
                 files_changed: 20,
+                net_modifications: 500,
+                net_additions: 400,
             },
         );
         by_language.insert(
@@ -623,6 +636,8 @@ mod tests {
                 additions: 200,
                 deletions: 50,
                 files_changed: 10,
+                net_modifications: 200,
+                net_additions: 150,
             },
         );
 
@@ -633,6 +648,8 @@ mod tests {
             total_commits: 42,
             total_additions: 700,
             total_deletions: 150,
+            total_net_modifications: 700,
+            total_net_additions: 550,
         }
     }
 
@@ -655,6 +672,7 @@ mod tests {
             30,
             false,
             NumberFormat::Plain,
+            None,
             2,
             None,
         )
@@ -666,6 +684,7 @@ mod tests {
         assert!(svg.contains(">42<"));
         assert!(svg.contains(">+700<"));
         assert!(svg.contains(">-150<"));
+        assert!(svg.contains(">+550<"));
         assert!(svg.contains("Rust"));
         assert!(svg.contains("Python"));
         assert_eq!(svg.matches("class=\"stat-label\"").count(), 9);
@@ -684,6 +703,7 @@ mod tests {
             30,
             false,
             NumberFormat::Plain,
+            None,
             2,
             None,
         )
@@ -707,6 +727,7 @@ mod tests {
             30,
             false,
             NumberFormat::Plain,
+            None,
             2,
             None,
         )
@@ -736,6 +757,7 @@ mod tests {
             30,
             true,
             NumberFormat::Plain,
+            None,
             2,
             None,
         )
@@ -743,7 +765,7 @@ mod tests {
 
         assert_eq!(svg.matches("class=\"stat-label\"").count(), 6);
         assert!(svg.contains("Pull Requests:"));
-        assert!(!svg.contains("Net Change:"));
+        assert!(!svg.contains("Net Adds:"));
     }
 
     #[test]
@@ -755,6 +777,7 @@ mod tests {
                 additions: 10,
                 deletions: 5,
                 files_changed: 2,
+                ..Default::default()
             },
         );
         by_language.insert(
@@ -763,6 +786,7 @@ mod tests {
                 additions: 999,
                 deletions: 1,
                 files_changed: 50,
+                ..Default::default()
             },
         );
         by_language.insert(
@@ -771,6 +795,7 @@ mod tests {
                 additions: 500,
                 deletions: 100,
                 files_changed: 20,
+                ..Default::default()
             },
         );
         by_language.insert(
@@ -779,6 +804,7 @@ mod tests {
                 additions: 300,
                 deletions: 50,
                 files_changed: 20,
+                ..Default::default()
             },
         );
         by_language.insert(
@@ -787,6 +813,7 @@ mod tests {
                 additions: 200,
                 deletions: 10,
                 files_changed: 20,
+                ..Default::default()
             },
         );
 
@@ -797,6 +824,8 @@ mod tests {
             total_commits: 0,
             total_additions: 0,
             total_deletions: 0,
+            total_net_modifications: 0,
+            total_net_additions: 0,
         };
 
         let lang_col_w = 148;
@@ -837,6 +866,7 @@ mod tests {
             30,
             false,
             NumberFormat::Plain,
+            None,
             2,
             Some("Custom"),
         )

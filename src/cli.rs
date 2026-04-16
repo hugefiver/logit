@@ -346,6 +346,13 @@ pub struct GithubCardArgs {
 
     #[arg(
         long,
+        value_enum,
+        help = "Number format override for line-count metrics (additions, deletions, net)"
+    )]
+    pub number_format_lines: Option<NumberFormat>,
+
+    #[arg(
+        long,
         default_value_t = 2,
         help = "Number of language rows in legend (default: 2)"
     )]
@@ -405,6 +412,13 @@ pub struct GithubMultiArgs {
         help = "Number display format in SVG stats"
     )]
     pub number_format: NumberFormat,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Number format override for line-count metrics (additions, deletions, net)"
+    )]
+    pub number_format_lines: Option<NumberFormat>,
 }
 
 #[cfg(test)]
