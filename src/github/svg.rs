@@ -191,7 +191,7 @@ pub fn render_multi_card(
 
     let stat_row_start = 40usize;
     let stat_row_spacing = 24usize;
-    let value_x = 115usize;
+    let value_x = col_width - 2 * col_pad;
 
     let bar_y = 160usize;
     let legend_start_y = bar_y + 24;
@@ -387,7 +387,7 @@ fn build_stat_items(
     let margin = 25usize;
     let col_width = (card_width - 2 * margin) / if short { 2 } else { 3 };
     let col_x: [usize; 3] = [margin, margin + col_width, margin + 2 * col_width];
-    let value_x: usize = 130;
+    let value_x: usize = col_width - 8;
     let line_fmt = num_fmt_lines.unwrap_or(num_fmt);
 
     let mut push =
@@ -443,7 +443,7 @@ fn build_stat_items(
             2,
             ICON_PR,
             "Pull Requests:",
-            format_num(summary.total_prs as u64, num_fmt),
+            format_num(summary.total_prs, num_fmt),
             "stat-val",
         );
         push(
@@ -451,7 +451,7 @@ fn build_stat_items(
             2,
             ICON_ISSUE,
             "Issues:",
-            format_num(summary.total_issues as u64, num_fmt),
+            format_num(summary.total_issues, num_fmt),
             "stat-val",
         );
 
@@ -481,7 +481,7 @@ fn build_stat_items(
         0,
         ICON_PR,
         "Pull Requests:",
-        format_num(summary.total_prs as u64, num_fmt),
+        format_num(summary.total_prs, num_fmt),
         "stat-val",
     );
 
@@ -515,7 +515,7 @@ fn build_stat_items(
         2,
         ICON_PR,
         "PR Reviews:",
-        format_num(summary.total_reviews as u64, num_fmt),
+        format_num(summary.total_reviews, num_fmt),
         "stat-val",
     );
     push(
@@ -523,7 +523,7 @@ fn build_stat_items(
         2,
         ICON_ISSUE,
         "Issues:",
-        format_num(summary.total_issues as u64, num_fmt),
+        format_num(summary.total_issues, num_fmt),
         "stat-val",
     );
     push(

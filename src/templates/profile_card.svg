@@ -51,7 +51,7 @@
     <path d="{{ item.icon }}"></path>
   </svg>
   <text x="22" y="0" dominant-baseline="central" class="stat-label">{{ item.label }}</text>
-  <text x="{{ item.value_x }}" y="0" dominant-baseline="central" class="{{ item.value_class }}">{{ item.value }}</text>
+  <text x="{{ item.value_x }}" y="0" dominant-baseline="central" text-anchor="end" class="{{ item.value_class }}">{{ item.value }}</text>
 </g>
 {% endfor %}
 
