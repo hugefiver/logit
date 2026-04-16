@@ -33,7 +33,7 @@ pub(crate) fn format_num(n: u64, num_fmt: NumberFormat) -> String {
             }
             let mut result = String::with_capacity(len + (len - 1) / 3);
             for (i, &b) in bytes.iter().enumerate() {
-                if i > 0 && (len - i) % 3 == 0 {
+                if i > 0 && (len - i).is_multiple_of(3) {
                     result.push(',');
                 }
                 result.push(b as char);

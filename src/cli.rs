@@ -2,20 +2,15 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum NumberFormat {
     /// Numbers with thousand separators (1,234,567)
+    #[default]
     Separated,
     /// Plain numbers without separators (1234567)
     Plain,
     /// Short format with suffixes (1.2k, 3.4M)
     Short,
-}
-
-impl Default for NumberFormat {
-    fn default() -> Self {
-        NumberFormat::Separated
-    }
 }
 
 #[derive(Parser)]
