@@ -420,42 +420,6 @@ impl GithubClient {
         Ok(all_repos)
     }
 
-    /// Get contributor stats for a repo (weekly add/del per contributor).
-    /// Returns empty vec on 202 (stats computing) or error.
-    #[allow(dead_code)]
-    pub fn get_contributor_stats(
-        &self,
-        owner: &str,
-        repo: &str,
-    ) -> anyhow::Result<Vec<ContributorStat>> {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/stats/contributors");
-        // GitHub may return 202 if stats are being computed; retry once after a short wait
-        for attempt in 0..2 {
-            let resp = self.client.get(&url).send()?;
-            match resp.status().as_u16() {
-                200 => {
-                    let stats: Vec<ContributorStat> = resp.json()?;
-                    return Ok(stats);
-                }
-                202 => {
-                    if attempt == 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        continue;
-                    }
-                    return Ok(Vec::new());
-                }
-                204 => return Ok(Vec::new()),
-                403 => {
-                    anyhow::bail!("GitHub API rate limit exceeded");
-                }
-                _ => {
-                    resp.error_for_status()?;
-                }
-            }
-        }
-        Ok(Vec::new())
-    }
-
     pub fn resolve_emails(
         &self,
         owner: &str,
@@ -1458,21 +1422,6 @@ struct CommitResponse {
 #[derive(Debug, Deserialize)]
 struct CommitAuthor {
     login: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ContributorStat {
-    pub author: Option<ContributorAuthor>,
-    #[allow(dead_code)]
-    pub total: u64,
-    pub weeks: Vec<ContributorWeek>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ContributorAuthor {
-    pub login: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
