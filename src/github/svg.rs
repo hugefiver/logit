@@ -325,7 +325,7 @@ fn build_multi_lang_bars(
         .filter(|(_, total)| *total > 0)
         .collect();
 
-    langs.sort_by(|a, b| b.1.cmp(&a.1));
+    langs.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let total: u64 = langs.iter().map(|(_, v)| v).sum();
     if total == 0 {
@@ -556,7 +556,7 @@ fn build_lang_bars(
         .filter(|(_, total)| *total > 0)
         .collect();
 
-    langs.sort_by(|a, b| b.1.cmp(&a.1));
+    langs.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let total: u64 = langs.iter().map(|(_, v)| v).sum();
     if total == 0 {

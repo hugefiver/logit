@@ -1,7 +1,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     DefaultTerminal, Frame,
@@ -30,7 +30,7 @@ fn sorted_languages(period: &PeriodStats) -> Vec<(&String, u64, u64)> {
         .iter()
         .map(|(name, ls)| (name, ls.additions, ls.deletions))
         .collect();
-    langs.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+    langs.sort_by_key(|b| std::cmp::Reverse(b.1 + b.2));
     langs
 }
 

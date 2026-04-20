@@ -266,9 +266,9 @@ fn aggregate_languages(
         .map(|(lang, (a, d, f))| (lang, a, d, f))
         .collect();
     match sort.unwrap_or(&SortBy::Additions) {
-        SortBy::Additions | SortBy::Commits => rows.sort_by(|a, b| b.1.cmp(&a.1)),
-        SortBy::Deletions => rows.sort_by(|a, b| b.2.cmp(&a.2)),
-        SortBy::Files => rows.sort_by(|a, b| b.3.cmp(&a.3)),
+        SortBy::Additions | SortBy::Commits => rows.sort_by_key(|b| std::cmp::Reverse(b.1)),
+        SortBy::Deletions => rows.sort_by_key(|b| std::cmp::Reverse(b.2)),
+        SortBy::Files => rows.sort_by_key(|b| std::cmp::Reverse(b.3)),
         SortBy::Name => rows.sort_by(|a, b| a.0.cmp(&b.0)),
     }
     rows
@@ -374,7 +374,7 @@ fn aggregate_authors(
                 .into_iter()
                 .map(|(lang, (la, ld, lf))| (lang, la, ld, lf))
                 .collect();
-            langs.sort_by(|a, b| b.1.cmp(&a.1));
+            langs.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             let top_lang = langs.first().map(|(l, _, _, _)| l.clone()).unwrap_or_default();
             let author_emails = emails.remove(&key).unwrap_or_default();
@@ -708,9 +708,9 @@ fn render_period_table(
 
         let mut langs: Vec<_> = period.by_language.iter().collect();
         match sort.unwrap_or(&SortBy::Additions) {
-            SortBy::Additions | SortBy::Commits => langs.sort_by(|a, b| b.1.additions.cmp(&a.1.additions)),
-            SortBy::Deletions => langs.sort_by(|a, b| b.1.deletions.cmp(&a.1.deletions)),
-            SortBy::Files => langs.sort_by(|a, b| b.1.files_changed.cmp(&a.1.files_changed)),
+            SortBy::Additions | SortBy::Commits => langs.sort_by_key(|b| std::cmp::Reverse(b.1.additions)),
+            SortBy::Deletions => langs.sort_by_key(|b| std::cmp::Reverse(b.1.deletions)),
+            SortBy::Files => langs.sort_by_key(|b| std::cmp::Reverse(b.1.files_changed)),
             SortBy::Name => langs.sort_by(|a, b| a.0.cmp(b.0)),
         }
 
