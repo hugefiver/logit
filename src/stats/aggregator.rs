@@ -58,7 +58,7 @@ pub fn aggregate_by_author(
     lang_filter: Option<&str>,
 ) -> Vec<PeriodStats> {
     aggregate_commits_with_bucket_key(commits, author_filter, lang_filter, |commit| {
-        format!("{} <{}>", commit.author.name, commit.author.email)
+        commit.author.name.clone()
     })
 }
 
@@ -96,12 +96,12 @@ where
 
         ps.total_commits += 1;
 
-        let author_key = format!("{} <{}>", commit.author.name, commit.author.email);
+        let author_key = commit.author.name.clone();
         let author_entry = ps.by_author.entry(author_key.clone()).or_default();
         author_entry.commits += 1;
 
         for co in &commit.co_authors {
-            let co_key = format!("{} <{}>", co.name, co.email);
+            let co_key = co.name.clone();
             let co_entry = ps.by_author.entry(co_key).or_default();
             co_entry.co_authored_commits += 1;
         }
@@ -143,7 +143,7 @@ where
             }
 
             for co in &commit.co_authors {
-                let co_key = format!("{} <{}>", co.name, co.email);
+                let co_key = co.name.clone();
                 let co_entry = ps.by_author.get_mut(&co_key).expect("just inserted");
                 co_entry.co_authored_additions += fc.additions;
                 co_entry.co_authored_deletions += fc.deletions;
@@ -347,7 +347,7 @@ pub fn aggregate_totals(period_stats: &[PeriodStats]) -> PeriodStats {
 fn group_key(commit: &CommitStats, group: &GroupBy, period: &Period) -> String {
     match group {
         GroupBy::Repo => commit.repo.clone(),
-        GroupBy::Author => format!("{} <{}>", commit.author.name, commit.author.email),
+        GroupBy::Author => commit.author.name.clone(),
         GroupBy::Period => bucket_timestamp(&commit.timestamp, period),
         GroupBy::Language => unreachable!("Language is not a tree-level partition"),
     }
@@ -412,7 +412,15 @@ pub fn build_group_tree(
     if groups.is_empty() {
         return vec![];
     }
-    let mut nodes = build_group_tree_inner(commits, groups, period, author_filter, lang_filter);
+    // Trailing Language collapses into the leaf node's by_language breakdown,
+    // which the renderer prints automatically. A separate partition level
+    // would just duplicate the parent.
+    let effective: Vec<GroupBy> = if groups.len() > 1 && matches!(groups.last(), Some(GroupBy::Language)) {
+        groups[..groups.len() - 1].to_vec()
+    } else {
+        groups.to_vec()
+    };
+    let mut nodes = build_group_tree_inner(commits, &effective, period, author_filter, lang_filter);
     prune_empty_nodes(&mut nodes);
     nodes
 }
@@ -656,10 +664,10 @@ mod tests {
         assert_eq!(result[0].by_language["Rust"].additions, 30);
         assert_eq!(result[0].by_language["Rust"].files_changed, 2);
 
-        assert!(result[0].by_author.contains_key("Alice <alice@test.com>"));
-        assert!(result[0].by_author.contains_key("Bob <bob@test.com>"));
-        assert_eq!(result[0].by_author["Alice <alice@test.com>"].commits, 1);
-        assert_eq!(result[0].by_author["Bob <bob@test.com>"].commits, 1);
+        assert!(result[0].by_author.contains_key("Alice"));
+        assert!(result[0].by_author.contains_key("Bob"));
+        assert_eq!(result[0].by_author["Alice"].commits, 1);
+        assert_eq!(result[0].by_author["Bob"].commits, 1);
     }
 
     #[test]
@@ -698,11 +706,11 @@ mod tests {
         assert_eq!(result[0].total_additions, 25);
         assert_eq!(result[0].total_deletions, 6);
 
-        assert!(result[0].by_author.contains_key("Alice <alice@test.com>"));
+        assert!(result[0].by_author.contains_key("Alice"));
         assert!(result[0]
             .by_author
-            .contains_key("Charlie <charlie@test.com>"));
-        assert!(!result[0].by_author.contains_key("Bob <bob@test.com>"));
+            .contains_key("Charlie"));
+        assert!(!result[0].by_author.contains_key("Bob"));
     }
 
     #[test]
@@ -764,8 +772,8 @@ mod tests {
         assert_eq!(totals.by_language["Python"].additions, 8);
         assert_eq!(totals.by_language["Python"].files_changed, 1);
 
-        assert_eq!(totals.by_author["Alice <alice@test.com>"].commits, 2);
-        assert_eq!(totals.by_author["Alice <alice@test.com>"].additions, 38);
+        assert_eq!(totals.by_author["Alice"].commits, 2);
+        assert_eq!(totals.by_author["Alice"].additions, 38);
     }
 
     #[test]
@@ -795,7 +803,7 @@ mod tests {
         let totals = aggregate_totals(&periods);
 
         // Bob appears as co-author across both periods
-        let bob_stats = &totals.by_author["Bob <bob@test.com>"];
+        let bob_stats = &totals.by_author["Bob"];
         assert_eq!(bob_stats.co_authored_additions, 30);
         assert_eq!(bob_stats.co_authored_deletions, 7);
 
@@ -926,13 +934,13 @@ mod tests {
         assert!(!totals.by_language.contains_key("Rust"));
         assert!(totals.by_language.contains_key("Python"));
 
-        let alice = totals.by_author.get("Alice <alice@test.com>").unwrap();
+        let alice = totals.by_author.get("Alice").unwrap();
         assert_eq!(alice.additions, 5);
         assert_eq!(alice.deletions, 1);
         assert!(!alice.languages.contains_key("Rust"));
         assert!(alice.languages.contains_key("Python"));
 
-        let bob = totals.by_author.get("Bob <bob@test.com>").unwrap();
+        let bob = totals.by_author.get("Bob").unwrap();
         assert_eq!(bob.additions, 0);
         assert_eq!(bob.deletions, 0);
         assert!(!bob.languages.contains_key("Rust"));

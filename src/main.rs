@@ -118,13 +118,35 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     let author_filter = args.author.as_deref();
     let lang_filter = args.lang.as_deref();
     let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
+    let compact = !args.no_compact;
+    let columns = cli::resolve_columns(&args.columns, &args.exclude_columns);
 
     if let Err(e) = stats::aggregator::validate_groups(&args.group) {
         anyhow::bail!(e);
     }
+    if let Err(e) = stats::aggregator::validate_groups(&args.groups) {
+        anyhow::bail!(e);
+    }
 
-    let effective = stats::aggregator::effective_groups(&commits, &args.group, &period);
-    let use_tree = effective.len() > 1;
+    let primary_candidates =
+        stats::aggregator::effective_groups(&commits, &args.group, &period);
+    let primary = primary_candidates
+        .first()
+        .copied()
+        .unwrap_or(GroupBy::Language);
+
+    let mut effective: Vec<GroupBy> = Vec::with_capacity(1 + args.groups.len());
+    effective.push(primary);
+    for g in &args.groups {
+        if !effective.contains(g) {
+            effective.push(*g);
+        }
+    }
+    if let Err(e) = stats::aggregator::validate_groups(&effective) {
+        anyhow::bail!(e);
+    }
+
+    let use_tree = !args.groups.is_empty();
 
     if use_tree {
         let mut nodes = stats::aggregator::build_group_tree(
@@ -143,7 +165,8 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
                     &leaf_group,
                     args.sort.as_ref(),
                     num_fmt,
-                    args.compact,
+                    &columns,
+                    compact,
                     args.inline_tree,
                 );
                 write_output(content, args.output.as_deref())?;
@@ -158,7 +181,7 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
             }
         }
     } else {
-        let group = effective.first().copied().unwrap_or(GroupBy::Language);
+        let group = primary;
 
         let mut period_stats = if matches!(group, GroupBy::Repo) {
             stats::aggregator::aggregate_by_repo(&commits, author_filter, lang_filter)
@@ -177,7 +200,19 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
 
         match args.format {
             OutputFormat::Table => {
-                let content = output::table::render_stats_table(&period_stats, &totals, &group, &args.show_email, &args.dedup, &identity_map, args.sort.as_ref(), num_fmt, args.compact, args.inline_tree);
+                let content = output::table::render_stats_table(
+                    &period_stats,
+                    &totals,
+                    &group,
+                    &args.show_email,
+                    &args.dedup,
+                    &identity_map,
+                    args.sort.as_ref(),
+                    num_fmt,
+                    &columns,
+                    compact,
+                    args.inline_tree,
+                );
                 write_output(content, args.output.as_deref())?;
             }
             OutputFormat::Json => {
@@ -277,6 +312,8 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
 
     let period = args.period.unwrap_or(Period::Month);
     let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
+    let compact = !args.no_compact;
+    let columns = cli::resolve_columns(&args.columns, &args.exclude_columns);
 
     if let Err(e) = stats::aggregator::validate_groups(&args.group) {
         anyhow::bail!(e);
@@ -335,7 +372,8 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
                 &identity_map,
                 args.sort.as_ref(),
                 num_fmt,
-                args.compact,
+                &columns,
+                compact,
                 args.inline_tree,
             );
             write_output(content, args.output.as_deref())?;

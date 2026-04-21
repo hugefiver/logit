@@ -89,10 +89,18 @@ pub struct StatsArgs {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "language",
-        help = "Group stats by language, author, period, or repo (comma-separated for multi-level, e.g. repo,author,period)"
+        default_value = "repo,author,language",
+        help = "Single-level grouping with fallback. Tries each in order and uses the first level that has more than one distinct value."
     )]
     pub group: Vec<GroupBy>,
+
+    #[arg(
+        long = "groups",
+        value_enum,
+        value_delimiter = ',',
+        help = "Multi-level grouping displayed as a tree (comma-separated, e.g. repo,author,period). Overrides --group."
+    )]
+    pub groups: Vec<GroupBy>,
 
     #[arg(
         short = 'd',
@@ -131,8 +139,27 @@ pub struct StatsArgs {
     #[arg(long, help = "Show language details inline under each group")]
     pub inline_tree: bool,
 
-    #[arg(long, help = "Use compact single-line format for changes")]
+    #[arg(long, help = "Use full multi-column format (disables compact)")]
+    pub no_compact: bool,
+
+    #[arg(long, hide = true, help = "[deprecated] compact is now the default")]
     pub compact: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Columns to display: commits,adds,dels,net,files (default: commits,adds,dels,files). Overrides --exclude-columns."
+    )]
+    pub columns: Vec<Column>,
+
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Columns to exclude (ignored if --columns is set)"
+    )]
+    pub exclude_columns: Vec<Column>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -165,6 +192,40 @@ pub enum SortBy {
     Deletions,
     Files,
     Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum Column {
+    Commits,
+    Adds,
+    Dels,
+    Net,
+    Files,
+}
+
+impl Column {
+    pub fn default_set() -> Vec<Column> {
+        vec![Column::Commits, Column::Adds, Column::Dels, Column::Files]
+    }
+}
+
+pub fn resolve_columns(include: &[Column], exclude: &[Column]) -> Vec<Column> {
+    let base: Vec<Column> = if include.is_empty() {
+        Column::default_set()
+    } else {
+        let mut seen = Vec::new();
+        for c in include {
+            if !seen.contains(c) {
+                seen.push(*c);
+            }
+        }
+        seen
+    };
+    if include.is_empty() && !exclude.is_empty() {
+        base.into_iter().filter(|c| !exclude.contains(c)).collect()
+    } else {
+        base
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -248,8 +309,8 @@ pub struct GithubFetchArgs {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "language",
-        help = "Group stats by language, author, period, or repo (comma-separated for multi-level, e.g. repo,author,period)"
+        default_value = "repo,author,language",
+        help = "Single-level grouping with fallback. Tries each in order and uses the first level that has more than one distinct value."
     )]
     pub group: Vec<GroupBy>,
 
@@ -263,11 +324,30 @@ pub struct GithubFetchArgs {
     )]
     pub short: bool,
 
-    #[arg(long, help = "Use compact single-line format for changes")]
+    #[arg(long, help = "Use full multi-column format (disables compact)")]
+    pub no_compact: bool,
+
+    #[arg(long, hide = true, help = "[deprecated] compact is now the default")]
     pub compact: bool,
 
     #[arg(long, help = "Show language details inline under each group")]
     pub inline_tree: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Columns to display: commits,adds,dels,net,files (default: commits,adds,dels,files). Overrides --exclude-columns."
+    )]
+    pub columns: Vec<Column>,
+
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Columns to exclude (ignored if --columns is set)"
+    )]
+    pub exclude_columns: Vec<Column>,
 
     #[arg(
         long,
