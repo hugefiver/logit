@@ -53,11 +53,21 @@ runs:
   steps:
     - uses: dtolnay/rust-toolchain@stable
 
+    - name: Compute logit source hash
+      id: srchash
+      shell: bash
+      run: |
+        HASH=$(find "${{ github.action_path }}" -type f \( -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' -o -path '*/src/*' \) \
+          -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
+        echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
     - uses: actions/cache@v5
       id: cache-logit
       with:
         path: ~/.cargo/bin/logit
-        key: logit-${{ runner.os }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path), format('{0}/src/**/*.rs', github.action_path)) }}
+        key: logit-${{ runner.os }}-${{ steps.srchash.outputs.hash }}
+        restore-keys: |
+          logit-${{ runner.os }}-
 
     - uses: actions/cache@v5
       with:
@@ -67,7 +77,7 @@ runs:
     - name: Install logit
       if: steps.cache-logit.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install --path "${{ github.action_path }}" --features github
+      run: cargo install --path "${{ github.action_path }}" --features github --force
 
     - name: Generate SVG
       shell: bash

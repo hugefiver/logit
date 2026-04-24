@@ -298,27 +298,77 @@ impl GithubClient {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<HashMap<String, Vec<CommitData>>> {
-        let mut all_commits = HashMap::new();
+        const MAX_PAGES_PER_REPO: usize = 20; // safety cap: 20 * 100 = 2000 commits per repo per window
+        let mut all_commits: HashMap<String, Vec<CommitData>> = HashMap::new();
 
         for repo_batch in repos.chunks(5) {
-            let query = build_batch_history_query(repo_batch);
-            let variables = serde_json::json!({
-                "userId": user_node_id,
-                "since": since,
-                "until": until,
-            });
+            let mut active: Vec<PageRequest> = repo_batch
+                .iter()
+                .enumerate()
+                .map(|(i, (o, n))| PageRequest {
+                    batch_index: i,
+                    owner: o.clone(),
+                    name: n.clone(),
+                    after: None,
+                })
+                .collect();
 
-            let data = self.graphql_query(&query, &variables)?;
-            let parsed = parse_batch_history_data(data, repo_batch)?;
+            let mut pages_fetched: HashMap<usize, usize> = HashMap::new();
 
-            for (repo_name, parsed_repo) in parsed {
-                if parsed_repo.total_count > 100 {
-                    eprintln!(
-                        "Warning: commit history truncated for {repo_name}: {} commits (showing first 100).",
-                        parsed_repo.total_count
-                    );
+            while !active.is_empty() {
+                let query = build_batch_history_query(&active);
+                let mut variables = serde_json::json!({
+                    "userId": user_node_id,
+                    "since": since,
+                    "until": until,
+                });
+                if let Some(map) = variables.as_object_mut() {
+                    for req in &active {
+                        let value = match &req.after {
+                            Some(c) => serde_json::Value::String(c.clone()),
+                            None => serde_json::Value::Null,
+                        };
+                        map.insert(format!("after{}", req.batch_index), value);
+                    }
                 }
-                all_commits.insert(repo_name, parsed_repo.commits);
+
+                let data = self.graphql_query(&query, &variables)?;
+                let parsed = parse_batch_history_data(data, &active)?;
+
+                let mut next_active = Vec::new();
+                for req in active {
+                    let repo_name = format!("{}/{}", req.owner, req.name);
+                    let pages = pages_fetched.entry(req.batch_index).or_insert(0);
+                    *pages += 1;
+
+                    let Some(parsed_repo) = parsed.get(&req.batch_index) else {
+                        continue;
+                    };
+
+                    all_commits
+                        .entry(repo_name.clone())
+                        .or_default()
+                        .extend(parsed_repo.commits.iter().cloned());
+
+                    if parsed_repo.has_next_page {
+                        if *pages >= MAX_PAGES_PER_REPO {
+                            eprintln!(
+                                "Warning: hit page limit ({} pages = {} commits) for {repo_name}; older commits not fetched (totalCount={}).",
+                                MAX_PAGES_PER_REPO,
+                                MAX_PAGES_PER_REPO * 100,
+                                parsed_repo.total_count
+                            );
+                        } else if let Some(cursor) = &parsed_repo.end_cursor {
+                            next_active.push(PageRequest {
+                                batch_index: req.batch_index,
+                                owner: req.owner,
+                                name: req.name,
+                                after: Some(cursor.clone()),
+                            });
+                        }
+                    }
+                }
+                active = next_active;
             }
         }
 
@@ -631,12 +681,30 @@ struct GraphqlHistoryConnection {
     nodes: Option<Vec<GraphqlHistoryNode>>,
     #[serde(rename = "totalCount")]
     total_count: u64,
+    #[serde(rename = "pageInfo", default)]
+    page_info: GraphqlHistoryPageInfo,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+struct GraphqlHistoryPageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
+    #[serde(rename = "endCursor", default)]
+    end_cursor: Option<String>,
+}
+
 struct ParsedBatchHistoryRepo {
     commits: Vec<CommitData>,
     total_count: u64,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+struct PageRequest {
+    batch_index: usize,
+    owner: String,
+    name: String,
+    after: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -775,17 +843,19 @@ fn parse_contributions_collection_data(
 
 fn parse_batch_history_data(
     data: serde_json::Value,
-    repos: &[(String, String)],
-) -> anyhow::Result<HashMap<String, ParsedBatchHistoryRepo>> {
+    active: &[PageRequest],
+) -> anyhow::Result<HashMap<usize, ParsedBatchHistoryRepo>> {
     let obj = data
         .as_object()
         .context("batch history data should be a JSON object")?;
 
     let mut result = HashMap::new();
-    for (idx, (owner, name)) in repos.iter().enumerate() {
-        let alias = format!("repo{idx}");
+    for req in active {
+        let alias = format!("repo{}", req.batch_index);
         let mut commits = Vec::new();
         let mut total_count = 0;
+        let mut has_next_page = false;
+        let mut end_cursor = None;
 
         if let Some(repo_value) = obj.get(&alias)
             && !repo_value.is_null()
@@ -797,8 +867,12 @@ fn parse_batch_history_data(
 
             if !history_value.is_null() {
                 let history: GraphqlHistoryConnection = serde_json::from_value(history_value)
-                    .with_context(|| format!("failed to parse commit history for {owner}/{name}"))?;
+                    .with_context(|| {
+                        format!("failed to parse commit history for {}/{}", req.owner, req.name)
+                    })?;
                 total_count = history.total_count;
+                has_next_page = history.page_info.has_next_page;
+                end_cursor = history.page_info.end_cursor;
                 if let Some(nodes) = history.nodes {
                     commits = nodes
                         .into_iter()
@@ -813,10 +887,12 @@ fn parse_batch_history_data(
         }
 
         result.insert(
-            format!("{owner}/{name}"),
+            req.batch_index,
             ParsedBatchHistoryRepo {
                 commits,
                 total_count,
+                has_next_page,
+                end_cursor,
             },
         );
     }
@@ -824,16 +900,23 @@ fn parse_batch_history_data(
     Ok(result)
 }
 
-fn build_batch_history_query(repos: &[(String, String)]) -> String {
+fn build_batch_history_query(active: &[PageRequest]) -> String {
     let mut query = String::from(
-        "query($userId: ID!, $since: GitTimestamp, $until: GitTimestamp) {\n  rateLimit { cost remaining resetAt }\n",
+        "query($userId: ID!, $since: GitTimestamp, $until: GitTimestamp",
     );
+    for req in active {
+        query.push_str(&format!(", $after{}: String", req.batch_index));
+    }
+    query.push_str(") {\n  rateLimit { cost remaining resetAt }\n");
 
-    for (idx, (owner, name)) in repos.iter().enumerate() {
-        let owner_literal = serde_json::to_string(owner).unwrap_or_else(|_| format!("\"{owner}\""));
-        let name_literal = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
+    for req in active {
+        let owner_literal =
+            serde_json::to_string(&req.owner).unwrap_or_else(|_| format!("\"{}\"", req.owner));
+        let name_literal =
+            serde_json::to_string(&req.name).unwrap_or_else(|_| format!("\"{}\"", req.name));
+        let i = req.batch_index;
         query.push_str(&format!(
-            "  repo{idx}: repository(owner: {owner_literal}, name: {name_literal}) {{\n    defaultBranchRef {{\n      target {{\n        ... on Commit {{\n          history(author: {{id: $userId}}, since: $since, until: $until, first: 100) {{\n            nodes {{ additions deletions committedDate }}\n            totalCount\n          }}\n        }}\n      }}\n    }}\n  }}\n"
+            "  repo{i}: repository(owner: {owner_literal}, name: {name_literal}) {{\n    defaultBranchRef {{\n      target {{\n        ... on Commit {{\n          history(author: {{id: $userId}}, since: $since, until: $until, first: 100, after: $after{i}) {{\n            pageInfo {{ hasNextPage endCursor }}\n            nodes {{ additions deletions committedDate }}\n            totalCount\n          }}\n        }}\n      }}\n    }}\n  }}\n"
         ));
     }
 
@@ -1795,15 +1878,26 @@ mod tests {
 
     #[test]
     fn parse_batch_history_with_aliases() {
-        let repos = vec![
-            ("octocat".to_string(), "repo-a".to_string()),
-            ("other".to_string(), "repo-b".to_string()),
+        let active = vec![
+            PageRequest {
+                batch_index: 0,
+                owner: "octocat".to_string(),
+                name: "repo-a".to_string(),
+                after: None,
+            },
+            PageRequest {
+                batch_index: 1,
+                owner: "other".to_string(),
+                name: "repo-b".to_string(),
+                after: None,
+            },
         ];
         let data = json!({
             "repo0": {
                 "defaultBranchRef": {
                     "target": {
                         "history": {
+                            "pageInfo": { "hasNextPage": false, "endCursor": null },
                             "nodes": [
                                 {
                                     "additions": 10,
@@ -1825,6 +1919,7 @@ mod tests {
                 "defaultBranchRef": {
                     "target": {
                         "history": {
+                            "pageInfo": { "hasNextPage": true, "endCursor": "abc" },
                             "nodes": [
                                 {
                                     "additions": 100,
@@ -1839,16 +1934,19 @@ mod tests {
             }
         });
 
-        let parsed = parse_batch_history_data(data, &repos).unwrap();
-        let repo0 = parsed.get("octocat/repo-a").unwrap();
+        let parsed = parse_batch_history_data(data, &active).unwrap();
+        let repo0 = parsed.get(&0).unwrap();
         assert_eq!(repo0.total_count, 2);
         assert_eq!(repo0.commits.len(), 2);
         assert_eq!(repo0.commits[0].additions, 10);
+        assert!(!repo0.has_next_page);
 
-        let repo1 = parsed.get("other/repo-b").unwrap();
+        let repo1 = parsed.get(&1).unwrap();
         assert_eq!(repo1.total_count, 150);
         assert_eq!(repo1.commits.len(), 1);
         assert_eq!(repo1.commits[0].deletions, 50);
+        assert!(repo1.has_next_page);
+        assert_eq!(repo1.end_cursor.as_deref(), Some("abc"));
     }
 
     #[test]
