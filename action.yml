@@ -28,7 +28,7 @@ inputs:
     description: 'Include contributed repositories'
     default: 'false'
   include-private:
-    description: 'Include token holder''s own private repositories (requires a PAT belonging to `username`; `${{ github.token }}` will not work)'
+    description: 'Include token holder''s own private repositories (requires a PAT belonging to `username`; the default workflow token will not work)'
     default: 'false'
   exclude-lang:
     description: 'Comma-separated languages to exclude'
