@@ -121,6 +121,38 @@ query($login: String!, $after: String) {
 }
 "#;
 
+/// Enumerate the token holder's own PRIVATE repos directly via `viewer`.
+/// Used to bypass the long-standing GitHub limitation where
+/// `contributionsCollection.commitContributionsByRepository` hides private data
+/// for fine-grained PATs. Combined with `batch_commit_history` (which works
+/// against fine-grained tokens with Contents:read), this surfaces commit/line
+/// stats for owner-private repos. PR/Issue/Review counts remain public-only.
+const VIEWER_PRIVATE_REPOS_QUERY: &str = r#"
+query($after: String) {
+  rateLimit { cost remaining resetAt }
+  viewer {
+    login
+    repositories(
+      first: 100,
+      after: $after,
+      privacy: PRIVATE,
+      ownerAffiliations: [OWNER],
+      orderBy: { field: PUSHED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        name
+        owner { login }
+        isFork
+        languages(first: 10, orderBy: { field: SIZE, direction: DESC }) {
+          edges { size node { name } }
+        }
+      }
+    }
+  }
+}
+"#;
+
 impl GithubClient {
     pub fn new() -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
@@ -470,6 +502,38 @@ impl GithubClient {
         Ok(all_repos)
     }
 
+    pub fn list_viewer_private_repos(&self) -> anyhow::Result<(String, Vec<RepoWithLangs>)> {
+        let mut all_repos = Vec::new();
+        let mut after: Option<String> = None;
+        let mut viewer_login = String::new();
+        let mut pages = 0usize;
+        const MAX_PAGES: usize = 10; // 10 * 100 = 1000 private repos cap
+
+        loop {
+            let variables = serde_json::json!({ "after": after });
+            let data = self.graphql_query(VIEWER_PRIVATE_REPOS_QUERY, &variables)?;
+            let response: GraphqlViewerPrivateReposData = serde_json::from_value(data)
+                .context("failed to parse GraphQL viewer private repositories data")?;
+            if viewer_login.is_empty() {
+                viewer_login = response.viewer.login.clone();
+            }
+            let connection = response.viewer.repositories;
+            for node in connection.nodes {
+                all_repos.push(graphql_repo_node_to_repo_with_langs(node));
+            }
+            pages += 1;
+            if !connection.page_info.has_next_page || pages >= MAX_PAGES {
+                break;
+            }
+            after = connection.page_info.end_cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+
+        Ok((viewer_login, all_repos))
+    }
+
     pub fn resolve_emails(
         &self,
         owner: &str,
@@ -583,6 +647,17 @@ struct GraphqlContributedReposData {
 struct GraphqlContributedReposUser {
     #[serde(rename = "repositoriesContributedTo")]
     repositories_contributed_to: GraphqlRepoConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlViewerPrivateReposData {
+    viewer: GraphqlViewerPrivateReposUser,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlViewerPrivateReposUser {
+    login: String,
+    repositories: GraphqlRepoConnection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1127,6 +1202,7 @@ pub fn fetch_user_stats(
     username: &str,
     include_forks: bool,
     include_contributed: bool,
+    include_private: bool,
     since: Option<i64>,
     until: Option<i64>,
     read_cache: bool,
@@ -1139,7 +1215,7 @@ pub fn fetch_user_stats(
     };
     let now = effective_window_end(until);
 
-    let (repo_rows, contribution_summary) = if let Some(cache) = cache.as_ref() {
+    let (mut repo_rows, contribution_summary) = if let Some(cache) = cache.as_ref() {
         get_contribution_repos_cached(
             client,
             cache,
@@ -1160,6 +1236,41 @@ pub fn fetch_user_stats(
             include_contributed,
         )?
     };
+
+    if include_private {
+        match client.list_viewer_private_repos() {
+            Ok((viewer_login, private_repos)) => {
+                if !viewer_login.eq_ignore_ascii_case(username) {
+                    eprintln!(
+                        "Warning: --include-private uses the token holder ('{viewer_login}'), but you queried '{username}'. Skipping private-repo merge.",
+                    );
+                } else {
+                    let existing_keys: std::collections::HashSet<String> = repo_rows
+                        .iter()
+                        .map(|(r, _)| repo_key(&r.owner, &r.name))
+                        .collect();
+                    let mut added = 0usize;
+                    for repo in private_repos {
+                        if !include_forks && repo.is_fork {
+                            continue;
+                        }
+                        let key = repo_key(&repo.owner, &repo.name);
+                        if existing_keys.contains(&key) {
+                            continue;
+                        }
+                        repo_rows.push((repo, 0));
+                        added += 1;
+                    }
+                    if added > 0 {
+                        eprintln!("Added {added} private repo(s) via --include-private");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to enumerate private repos: {e}");
+            }
+        }
+    }
 
     eprintln!("Found {} repos with contributions", repo_rows.len());
 

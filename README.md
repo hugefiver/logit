@@ -67,6 +67,10 @@ Requires a `GITHUB_TOKEN` environment variable (PAT with `read:user` scope).
 logit github fetch <username>
 logit github fetch <username> --period week --include-contributed
 
+# Include private repos (token must belong to <username>; bypasses fine-grained PAT
+# limitation that hides private contributions in contributionsCollection)
+logit github fetch <username> --include-private --include-contributed --include-forks
+
 # Generate SVG profile card
 logit github card <username>
 logit github card <username> --short --days 90
@@ -131,6 +135,7 @@ jobs:
 | `periods` | `week,month,year` | Periods (multi) |
 | `include-forks` | `false` | Include forks |
 | `include-contributed` | `false` | Include contributed repos |
+| `include-private` | `false` | Include token holder's private repos (requires PAT matching `username`; default `${{ github.token }}` is silently ignored) |
 | `exclude-lang` | | Languages to exclude |
 | `short` | `false` | Compact card layout |
 | `lang-rows` | `2` | Language rows |

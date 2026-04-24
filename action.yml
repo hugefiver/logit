@@ -27,6 +27,9 @@ inputs:
   include-contributed:
     description: 'Include contributed repositories'
     default: 'false'
+  include-private:
+    description: 'Include token holder''s own private repositories (requires a PAT belonging to `username`; `${{ github.token }}` will not work)'
+    default: 'false'
   exclude-lang:
     description: 'Comma-separated languages to exclude'
     default: ''
@@ -97,6 +100,7 @@ runs:
 
         if [ "${{ inputs.include-forks }}" = "true" ]; then CMD="$CMD --include-forks"; fi
         if [ "${{ inputs.include-contributed }}" = "true" ]; then CMD="$CMD --include-contributed"; fi
+        if [ "${{ inputs.include-private }}" = "true" ]; then CMD="$CMD --include-private"; fi
         if [ -n "${{ inputs.exclude-lang }}" ]; then CMD="$CMD --exclude-lang ${{ inputs.exclude-lang }}"; fi
 
         CMD="$CMD -o ${{ inputs.output }}"

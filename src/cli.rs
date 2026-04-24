@@ -269,6 +269,12 @@ pub struct GithubDataArgs {
     #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
     pub include_contributed: bool,
 
+    #[arg(
+        long,
+        help = "Include user's own private repos (enumerated directly via viewer.repositories; bypasses contributionsCollection restriction for fine-grained PATs). Requires the token user to match `username`."
+    )]
+    pub include_private: bool,
+
     #[arg(long, help = "Bypass disk cache (no read, no write)")]
     pub no_cache: bool,
 
@@ -282,7 +288,7 @@ pub struct GithubDataArgs {
 #[cfg(feature = "github")]
 #[derive(Subcommand)]
 pub enum GithubSubcommand {
-    /// Fetch GitHub user stats and export as JSON or table
+    /// Fetch GitHub user stats and export as JSON, table, or TUI
     Fetch(GithubFetchArgs),
     /// Generate SVG profile card
     Card(GithubCardArgs),
@@ -365,6 +371,8 @@ pub struct GithubFetchArgs {
 pub enum FetchFormat {
     Json,
     Table,
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 #[cfg(feature = "github")]
@@ -397,6 +405,12 @@ pub struct GithubCardArgs {
 
     #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
     pub include_contributed: bool,
+
+    #[arg(
+        long,
+        help = "Include user's own private repos (enumerated directly via viewer.repositories; bypasses contributionsCollection restriction for fine-grained PATs)."
+    )]
+    pub include_private: bool,
 
     #[arg(long, help = "Bypass disk cache (no read, no write)")]
     pub no_cache: bool,
@@ -463,6 +477,12 @@ pub struct GithubMultiArgs {
 
     #[arg(long, help = "Include repos contributed to (full history via GraphQL)")]
     pub include_contributed: bool,
+
+    #[arg(
+        long,
+        help = "Include user's own private repos (enumerated directly via viewer.repositories; bypasses contributionsCollection restriction for fine-grained PATs)."
+    )]
+    pub include_private: bool,
 
     #[arg(long, help = "Bypass disk cache (no read, no write)")]
     pub no_cache: bool,

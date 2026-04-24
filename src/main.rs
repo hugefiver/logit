@@ -306,6 +306,7 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
         args.data.until.as_deref(),
         args.data.include_forks,
         args.data.include_contributed,
+        args.data.include_private,
         args.data.no_cache,
         args.data.refresh_cache,
     )?;
@@ -378,6 +379,8 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
             );
             write_output(content, args.output.as_deref())?;
         }
+        #[cfg(feature = "tui")]
+        FetchFormat::Tui => output::tui::run_tui(&period_stats, &totals)?,
     }
 
     Ok(())
@@ -408,6 +411,7 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
                 args.until.as_deref(),
                 args.include_forks,
                 args.include_contributed,
+                args.include_private,
                 args.no_cache,
                 args.refresh_cache,
             )?;
@@ -531,6 +535,7 @@ fn fetch_github_data(
     until: Option<&str>,
     include_forks: bool,
     include_contributed: bool,
+    include_private: bool,
     no_cache: bool,
     refresh_cache: bool,
 ) -> anyhow::Result<(
@@ -569,6 +574,7 @@ fn fetch_github_data(
         username,
         include_forks,
         include_contributed,
+        include_private,
         since_ts,
         until_ts,
         read_cache,
@@ -635,6 +641,7 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
             &args.username,
             args.include_forks,
             args.include_contributed,
+            args.include_private,
             since_ts,
             None,
             read_cache,
