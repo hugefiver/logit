@@ -5,7 +5,7 @@ edition = "2024"
 description = "logit — lines of git"
 
 [dependencies]
-git2 = "0.20"
+git2 = "0.21"
 tokei = "14.0"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
