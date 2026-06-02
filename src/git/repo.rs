@@ -49,7 +49,7 @@ pub fn parse_remote_url(url: &str) -> Option<RemoteInfo> {
 pub fn get_remote_origin(repo_path: &Path) -> Option<String> {
     let repo = Repository::open(repo_path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
-    remote.url().map(|u| u.to_string())
+    remote.url().ok().map(|u| u.to_string())
 }
 
 pub struct RepoAnalyzer {
