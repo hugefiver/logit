@@ -33,7 +33,7 @@ features = ["blocking", "json"]
 optional = true
 
 [dependencies.tera]
-version = "1"
+version = "2"
 optional = true
 
 [features]

@@ -1703,7 +1703,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tera",
+ "tera 2.0.0",
  "thiserror 2.0.18",
  "tokei",
 ]
@@ -2957,6 +2957,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tera"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38ea62bd58771b570262e11ffa274fa9eda9986bd886e6e3a1f7f42afef8024c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "term_size"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3172,7 +3181,7 @@ dependencies = [
  "serde",
  "serde_json",
  "table_formatter",
- "tera",
+ "tera 1.20.1",
  "term_size",
  "toml",
 ]
