@@ -18,6 +18,8 @@ mod stats;
 mod github;
 
 use std::collections::HashMap;
+#[cfg(feature = "github")]
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -30,6 +32,166 @@ use stats::models::CommitStats;
 struct TimeRange {
     since: Option<DateTime<Utc>>,
     until_exclusive: Option<DateTime<Utc>>,
+}
+
+#[cfg(feature = "github")]
+fn collect_requested_github_logins(
+    me: Option<&filter::MeExpr>,
+    rules: &[exclude::ExcludeRule],
+) -> BTreeSet<String> {
+    let mut logins = me.map(filter::MeExpr::github_logins).unwrap_or_default();
+    logins.extend(
+        exclude::collect_github_users(rules)
+            .into_iter()
+            .map(|login| login.trim().to_ascii_lowercase())
+            .filter(|login| !login.is_empty()),
+    );
+    logins
+}
+
+#[cfg(feature = "github")]
+const MAX_COMMAND_GITHUB_LOGINS: usize = 8;
+
+#[cfg(feature = "github")]
+#[derive(Debug, Default)]
+struct CommandIdentityResolution {
+    reports: BTreeMap<String, github::api::IdentityResolutionReport>,
+    skipped_logins: usize,
+}
+
+#[cfg(feature = "github")]
+impl CommandIdentityResolution {
+    fn email_to_login_map(&self) -> HashMap<String, String> {
+        let mut mappings = HashMap::new();
+        for (login, report) in &self.reports {
+            let login = login.to_ascii_lowercase();
+            for email in &report.emails {
+                let email = git::author::canonical_email_key(email);
+                if !email.is_empty() {
+                    mappings.entry(email).or_insert_with(|| login.clone());
+                }
+            }
+        }
+        mappings
+    }
+
+    fn warning(&self) -> Option<String> {
+        let partial = self
+            .reports
+            .values()
+            .filter(|report| report.is_partial())
+            .collect::<Vec<_>>();
+        if partial.is_empty() && self.skipped_logins == 0 {
+            return None;
+        }
+
+        let mut parts = Vec::new();
+        if let Some(message) = partial
+            .iter()
+            .flat_map(|report| report.failures.iter())
+            .map(|failure| failure.message.as_str())
+            .find(|message| message.contains("GITHUB_TOKEN"))
+        {
+            parts.push(format!(
+                "GitHub identity resolution could not run: {message}; local noreply matching remains enabled"
+            ));
+        } else if !partial.is_empty() {
+            let logins = partial
+                .iter()
+                .map(|report| report.login.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "GitHub identity resolution is partial for {logins}; known emails were applied, but results may miss others"
+            ));
+        }
+        if self.skipped_logins > 0 {
+            parts.push(format!(
+                "skipped {} login(s) after the command limit of {MAX_COMMAND_GITHUB_LOGINS}",
+                self.skipped_logins
+            ));
+        }
+        Some(parts.join("; "))
+    }
+}
+
+#[cfg(feature = "github")]
+fn resolve_identity_reports<F>(
+    requested_logins: &BTreeSet<String>,
+    mut resolve: F,
+) -> CommandIdentityResolution
+where
+    F: FnMut(&str) -> github::api::IdentityResolutionReport,
+{
+    let logins = requested_logins
+        .iter()
+        .map(|login| login.trim().to_ascii_lowercase())
+        .filter(|login| !login.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut resolution = CommandIdentityResolution {
+        skipped_logins: logins.len().saturating_sub(MAX_COMMAND_GITHUB_LOGINS),
+        ..Default::default()
+    };
+
+    for login in logins.into_iter().take(MAX_COMMAND_GITHUB_LOGINS) {
+        let mut report = resolve(&login);
+        report.login = login.clone();
+        resolution.reports.insert(login, report);
+    }
+    resolution
+}
+
+#[cfg(feature = "github")]
+fn unavailable_identity_report(
+    login: &str,
+    message: String,
+) -> github::api::IdentityResolutionReport {
+    github::api::IdentityResolutionReport {
+        login: login.to_string(),
+        emails: BTreeSet::new(),
+        repositories_examined: 0,
+        logical_requests: 0,
+        truncated_repositories: false,
+        truncated_commits: false,
+        failures: vec![github::api::IdentityLookupFailure {
+            repository: None,
+            message,
+        }],
+    }
+}
+
+#[cfg(feature = "github")]
+fn resolve_command_identity_reports(
+    requested_logins: &BTreeSet<String>,
+) -> CommandIdentityResolution {
+    if requested_logins.is_empty() {
+        return CommandIdentityResolution::default();
+    }
+
+    match github::GithubClient::new() {
+        Ok(client) if client.has_token() => resolve_identity_reports(requested_logins, |login| {
+            client.resolve_user_identity(login)
+        }),
+        Ok(_) => resolve_identity_reports(requested_logins, |login| {
+            unavailable_identity_report(
+                login,
+                "GITHUB_TOKEN is not configured for GitHub identity resolution".to_string(),
+            )
+        }),
+        Err(error) => resolve_identity_reports(requested_logins, |login| {
+            unavailable_identity_report(
+                login,
+                format!("failed to initialize the GitHub identity client: {error}"),
+            )
+        }),
+    }
+}
+
+#[cfg(feature = "github")]
+#[derive(Debug, Default)]
+struct RemoteIdentityReport {
+    mappings: HashMap<String, String>,
+    warnings: Vec<String>,
 }
 
 fn write_output(content: String, path: Option<&std::path::Path>) -> anyhow::Result<()> {
@@ -85,6 +247,9 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
         .into_iter()
         .flatten()
         .collect();
+    let me_expr = args.me.as_deref().map(filter::parse_me_expr).transpose()?;
+    #[cfg(feature = "github")]
+    let requested_github_logins = collect_requested_github_logins(me_expr.as_ref(), &exclude_rules);
 
     let mut repos: Vec<PathBuf> = Vec::new();
     let mut scan_warnings = Vec::new();
@@ -140,9 +305,25 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
         }
     }
 
-    let identity_map = build_identity_map(&args.dedup, &repos, &commits);
+    #[cfg(feature = "github")]
+    let command_identity_resolution = resolve_command_identity_reports(&requested_github_logins);
+    #[cfg(feature = "github")]
+    if let Some(warning) = command_identity_resolution.warning() {
+        eprintln!("Warning: {warning}");
+    }
+    #[cfg(feature = "github")]
+    for (login, report) in &command_identity_resolution.reports {
+        let emails = report.emails.iter().cloned().collect::<Vec<_>>();
+        if !emails.is_empty() {
+            for rule in &mut exclude_rules {
+                rule.resolve_github_user(login, &emails);
+            }
+        }
+    }
 
-    let me_expr = args.me.as_deref().map(filter::parse_me_expr).transpose()?;
+    let mut identity_map = build_identity_map(&args.dedup, &repos, &commits);
+    #[cfg(feature = "github")]
+    identity_map.extend(command_identity_resolution.email_to_login_map());
 
     let commits = if let Some(ref expr) = me_expr {
         commits
@@ -152,33 +333,6 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     } else {
         commits
     };
-
-    #[cfg(feature = "github")]
-    {
-        let github_users = exclude::collect_github_users(&exclude_rules);
-        if !github_users.is_empty() {
-            match github::GithubClient::new() {
-                Ok(client) => {
-                    for username in &github_users {
-                        match client.resolve_user_emails(username) {
-                            Ok(emails) => {
-                                eprintln!("Resolved @{username} → {} email(s)", emails.len());
-                                for rule in &mut exclude_rules {
-                                    rule.resolve_github_user(username, &emails);
-                                }
-                            }
-                            Err(e) => eprintln!("Warning: failed to resolve @{username}: {e}"),
-                        }
-                    }
-                }
-                Err(_) => {
-                    eprintln!(
-                        "Warning: --exclude with @user requires GITHUB_TOKEN; skipping GitHub resolution"
-                    );
-                }
-            }
-        }
-    }
 
     let commits = exclude::filter_commits(commits, &exclude_rules);
 
@@ -521,32 +675,13 @@ fn build_remote_identity_map(
     repos: &[analyze::RepoInput],
     commits: &[stats::models::CommitStats],
 ) -> HashMap<String, String> {
-    let mut github_info = None;
-    for repo in repos {
-        if let Some(url) = git::repo::get_remote_origin(&repo.path)
-            && let Some(info) = git::repo::parse_remote_url(&url)
-            && matches!(info.platform, git::repo::Platform::GitHub)
-        {
-            github_info = Some(info);
-            break;
-        }
-    }
-
-    let Some(info) = github_info else {
+    let has_github_origin = repos.iter().any(|repo| {
+        git::repo::get_remote_origin(&repo.path)
+            .and_then(|url| git::repo::parse_remote_url(&url))
+            .is_some_and(|info| matches!(info.platform, git::repo::Platform::GitHub))
+    });
+    if !has_github_origin {
         return HashMap::new();
-    };
-
-    let mut all_emails: Vec<String> = Vec::new();
-    for commit in commits {
-        let email = &commit.author.email;
-        if !all_emails.contains(email) {
-            all_emails.push(email.clone());
-        }
-        for co in &commit.co_authors {
-            if !all_emails.contains(&co.email) {
-                all_emails.push(co.email.clone());
-            }
-        }
     }
 
     let client = match github::GithubClient::new() {
@@ -557,17 +692,93 @@ fn build_remote_identity_map(
         }
     };
 
-    eprintln!(
-        "Resolving {} email(s) via GitHub API ({}/{})...",
-        all_emails.len(),
-        info.owner,
-        info.repo
+    let report = build_remote_identity_map_with(
+        repos,
+        commits,
+        |repo| {
+            let url = git::repo::get_remote_origin(&repo.path)?;
+            let info = git::repo::parse_remote_url(&url)?;
+            matches!(info.platform, git::repo::Platform::GitHub).then_some((info.owner, info.repo))
+        },
+        |owner, repo, email| {
+            client
+                .resolve_single_email_result(owner, repo, email)
+                .map_err(|error| error.to_string())
+        },
     );
-    client
-        .resolve_emails(&info.owner, &info.repo, &all_emails)
-        .into_iter()
-        .map(|(email, login)| (email.to_ascii_lowercase(), login))
-        .collect()
+    for warning in &report.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    report.mappings
+}
+
+#[cfg(feature = "github")]
+fn build_remote_identity_map_with<O, R>(
+    repos: &[analyze::RepoInput],
+    commits: &[stats::models::CommitStats],
+    mut remote_for_repo: O,
+    mut resolve_email: R,
+) -> RemoteIdentityReport
+where
+    O: FnMut(&analyze::RepoInput) -> Option<(String, String)>,
+    R: FnMut(&str, &str, &str) -> Result<Option<String>, String>,
+{
+    let mut report = RemoteIdentityReport::default();
+    let mut first_success_origin = HashMap::new();
+    let mut ordered_repos = repos.iter().collect::<Vec<_>>();
+    ordered_repos.sort_by(|left, right| {
+        analyze::platform_repo_key(&left.id, cfg!(windows))
+            .cmp(&analyze::platform_repo_key(&right.id, cfg!(windows)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    for selected_repo in ordered_repos {
+        let Some((owner, repo)) = remote_for_repo(selected_repo) else {
+            continue;
+        };
+        let remote_name = format!("{owner}/{repo}");
+        let mut emails = BTreeSet::new();
+        for commit in commits
+            .iter()
+            .filter(|commit| commit.repo_id == selected_repo.id)
+        {
+            emails.insert(git::author::canonical_email_key(&commit.author.email));
+            emails.extend(
+                commit
+                    .co_authors
+                    .iter()
+                    .map(|author| git::author::canonical_email_key(&author.email)),
+            );
+        }
+
+        for email in emails.into_iter().filter(|email| !email.is_empty()) {
+            match resolve_email(&owner, &repo, &email) {
+                Ok(Some(login)) if !login.trim().is_empty() => {
+                    let login = login.trim().to_ascii_lowercase();
+                    if let Some(existing) = report.mappings.get(&email) {
+                        if existing != &login {
+                            let first_origin = first_success_origin
+                                .get(&email)
+                                .expect("mapped identity records its first successful origin");
+                            report.warnings.push(format!(
+                                "conflicting GitHub identity for '{email}': keeping '{existing}' from {first_origin}, ignoring '{login}' from {remote_name}"
+                            ));
+                        }
+                    } else {
+                        report.mappings.insert(email.clone(), login);
+                        first_success_origin.insert(email, remote_name.clone());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => report.warnings.push(format!(
+                    "failed to resolve GitHub identity for '{email}' in {remote_name}: {error}"
+                )),
+                Ok(Some(_)) => {}
+            }
+        }
+    }
+
+    report
 }
 
 #[cfg(feature = "github")]
@@ -1170,10 +1381,195 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[cfg(feature = "github")]
+    use std::cell::RefCell;
+
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2025, 2, 10, 12, 0, 0)
             .single()
             .unwrap()
+    }
+
+    #[cfg(feature = "github")]
+    fn identity_report(
+        login: &str,
+        emails: &[&str],
+        partial: bool,
+    ) -> github::api::IdentityResolutionReport {
+        github::api::IdentityResolutionReport {
+            login: login.to_string(),
+            emails: emails.iter().map(|email| (*email).to_string()).collect(),
+            repositories_examined: 1,
+            logical_requests: 1,
+            truncated_repositories: partial,
+            truncated_commits: false,
+            failures: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "github")]
+    fn remote_commit(repo_id: &str, email: &str) -> CommitStats {
+        CommitStats {
+            repo_id: repo_id.to_string(),
+            repo: repo_id.to_string(),
+            oid: format!("{repo_id}-oid"),
+            author: stats::models::Author {
+                name: "Author".to_string(),
+                email: email.to_string(),
+            },
+            committer: stats::models::Author {
+                name: "Committer".to_string(),
+                email: "committer@example.com".to_string(),
+            },
+            co_authors: Vec::new(),
+            timestamp: fixed_now(),
+            message_subject: "test".to_string(),
+            file_changes: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn shared_github_login_is_resolved_once_for_me_and_exclude() {
+        let me = filter::parse_me_expr("github:OctoCat").unwrap();
+        let rules = exclude::ExcludeRule::parse_many(":author:github:octocat").unwrap();
+        let requested = collect_requested_github_logins(Some(&me), &rules);
+        let calls = RefCell::new(Vec::new());
+
+        let resolution = resolve_identity_reports(&requested, |login| {
+            calls.borrow_mut().push(login.to_string());
+            identity_report(login, &["octocat@example.com"], false)
+        });
+
+        assert_eq!(requested, BTreeSet::from(["octocat".to_string()]));
+        assert_eq!(*calls.borrow(), vec!["octocat".to_string()]);
+        assert_eq!(
+            resolution.email_to_login_map(),
+            HashMap::from([("octocat@example.com".to_string(), "octocat".to_string())])
+        );
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn identity_resolution_limits_sorted_logins_and_emits_one_combined_warning() {
+        let requested = (0..10)
+            .rev()
+            .map(|index| format!("user-{index:02}"))
+            .collect::<BTreeSet<_>>();
+        let calls = RefCell::new(Vec::new());
+
+        let resolution = resolve_identity_reports(&requested, |login| {
+            calls.borrow_mut().push(login.to_string());
+            identity_report(login, &[], matches!(login, "user-00" | "user-01"))
+        });
+
+        assert_eq!(
+            *calls.borrow(),
+            (0..8)
+                .map(|index| format!("user-{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(resolution.skipped_logins, 2);
+        let warning = resolution.warning().expect("one combined warning");
+        assert_eq!(warning.matches("partial").count(), 1, "{warning}");
+        assert!(warning.contains("2 login(s)"), "{warning}");
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn remote_identity_map_continues_after_an_unresolved_origin() {
+        let repos = vec![
+            analyze::RepoInput {
+                path: PathBuf::from("one"),
+                id: "one".to_string(),
+                label: "one".to_string(),
+            },
+            analyze::RepoInput {
+                path: PathBuf::from("two"),
+                id: "two".to_string(),
+                label: "two".to_string(),
+            },
+        ];
+        let commits = vec![
+            remote_commit("one", "Alice@Example.com"),
+            remote_commit("two", "alice@example.com"),
+        ];
+        let calls = RefCell::new(Vec::new());
+
+        let report = build_remote_identity_map_with(
+            &repos,
+            &commits,
+            |repo| match repo.id.as_str() {
+                "one" => Some(("one".to_string(), "first".to_string())),
+                "two" => Some(("two".to_string(), "second".to_string())),
+                _ => None,
+            },
+            |owner, repo, email| {
+                calls.borrow_mut().push(format!("{owner}/{repo}:{email}"));
+                Ok(if owner == "two" {
+                    Some("OctoCat".to_string())
+                } else {
+                    None
+                })
+            },
+        );
+
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                "one/first:alice@example.com".to_string(),
+                "two/second:alice@example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            report.mappings,
+            HashMap::from([("alice@example.com".to_string(), "octocat".to_string())])
+        );
+        assert!(report.warnings.is_empty());
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn remote_identity_map_keeps_first_success_and_warns_once_on_conflict() {
+        let repos = vec![
+            analyze::RepoInput {
+                path: PathBuf::from("one"),
+                id: "one".to_string(),
+                label: "one".to_string(),
+            },
+            analyze::RepoInput {
+                path: PathBuf::from("two"),
+                id: "two".to_string(),
+                label: "two".to_string(),
+            },
+        ];
+        let commits = vec![
+            remote_commit("one", "alice@example.com"),
+            remote_commit("two", "alice@example.com"),
+        ];
+
+        let report = build_remote_identity_map_with(
+            &repos,
+            &commits,
+            |repo| match repo.id.as_str() {
+                "one" => Some(("one".to_string(), "first".to_string())),
+                "two" => Some(("two".to_string(), "second".to_string())),
+                _ => None,
+            },
+            |owner, _, _| {
+                Ok(Some(
+                    if owner == "one" { "Alice" } else { "Bob" }.to_string(),
+                ))
+            },
+        );
+
+        assert_eq!(
+            report.mappings,
+            HashMap::from([("alice@example.com".to_string(), "alice".to_string())])
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("one/first"));
+        assert!(report.warnings[0].contains("two/second"));
     }
 
     #[test]

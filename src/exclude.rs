@@ -7,6 +7,7 @@ use glob::Pattern;
 use regex::Regex;
 
 use crate::analyze::platform_repo_key;
+use crate::git::author::canonical_email_key;
 use crate::stats::models::Author;
 use crate::stats::models::CommitStats;
 
@@ -64,7 +65,10 @@ impl AndGroup {
     }
 
     fn has_commit_qualifiers(&self) -> bool {
-        self.author_pattern.is_some() || self.committer_pattern.is_some()
+        self.author_pattern.is_some()
+            || self.committer_pattern.is_some()
+            || !self.author_emails.is_empty()
+            || !self.committer_emails.is_empty()
     }
 
     fn is_empty(&self) -> bool {
@@ -256,15 +260,20 @@ impl ExcludeRule {
     }
 
     pub fn resolve_github_user(&mut self, username: &str, emails: &[String]) {
+        let emails = emails
+            .iter()
+            .map(|email| canonical_email_key(email))
+            .filter(|email| !email.is_empty())
+            .collect::<Vec<_>>();
         for group in &mut self.and_groups {
             if let Some(AuthorPattern::GitHubUser(ref u)) = group.author_pattern
-                && u == username
+                && u.eq_ignore_ascii_case(username)
             {
                 group.author_emails = emails.to_vec();
                 group.author_pattern = None;
             }
             if let Some(AuthorPattern::GitHubUser(ref u)) = group.committer_pattern
-                && u == username
+                && u.eq_ignore_ascii_case(username)
             {
                 group.committer_emails = emails.to_vec();
                 group.committer_pattern = None;
@@ -748,6 +757,42 @@ mod tests {
         rule.resolve_github_user("testuser", &["a@b.com".into(), "c@d.com".into()]);
         assert!(rule.and_groups[0].author_pattern.is_none());
         assert_eq!(rule.and_groups[0].author_emails.len(), 2);
+    }
+
+    #[test]
+    fn resolve_github_user_matches_login_case_insensitively() {
+        let mut rule = ExcludeRule::parse_many(":author:github:OctoCat")
+            .unwrap()
+            .remove(0);
+
+        rule.resolve_github_user("octocat", &["octocat@example.com".into()]);
+
+        assert!(rule.and_groups[0].author_pattern.is_none());
+        assert_eq!(
+            rule.and_groups[0].author_emails,
+            vec!["octocat@example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_github_user_applies_known_emails_to_author_and_committer() {
+        let mut rule = ExcludeRule::parse_many(":user:github:OctoCat")
+            .unwrap()
+            .remove(0);
+
+        rule.resolve_github_user("octocat", &[" OctoCat@Example.COM ".into()]);
+
+        assert!(rule.and_groups[0].author_pattern.is_none());
+        assert!(rule.and_groups[0].committer_pattern.is_none());
+        assert_eq!(
+            rule.and_groups[0].author_emails,
+            vec!["octocat@example.com".to_string()]
+        );
+        assert_eq!(
+            rule.and_groups[0].committer_emails,
+            vec!["octocat@example.com".to_string()]
+        );
+        assert!(rule.and_groups[0].has_commit_qualifiers());
     }
 
     #[test]

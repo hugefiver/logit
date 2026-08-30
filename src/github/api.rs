@@ -3,10 +3,11 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::cache::DiskCache;
 use crate::cli::{GroupBy, Period};
+use crate::git::author::canonical_email_key;
 use crate::stats::models::{GroupNode, PeriodStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +75,47 @@ pub struct GithubUser {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityLookupFailure {
+    pub repository: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityResolutionReport {
+    pub login: String,
+    pub emails: BTreeSet<String>,
+    pub repositories_examined: usize,
+    pub logical_requests: usize,
+    pub truncated_repositories: bool,
+    pub truncated_commits: bool,
+    pub failures: Vec<IdentityLookupFailure>,
+}
+
+impl IdentityResolutionReport {
+    #[allow(dead_code)] // Task 7 consumes report completeness at the command layer.
+    pub fn is_partial(&self) -> bool {
+        self.truncated_repositories || self.truncated_commits || !self.failures.is_empty()
+    }
+
+    #[allow(dead_code)] // Task 7 prints this report-level warning at the command layer.
+    pub fn warning(&self) -> Option<String> {
+        if !self.is_partial() {
+            return None;
+        }
+
+        let known_emails = if self.emails.is_empty() {
+            "none".to_string()
+        } else {
+            self.emails.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        Some(format!(
+            "Identity resolution for '{}' is partial; known emails: {known_emails}; results may miss others, so retry later or verify repository access.",
+            self.login
+        ))
+    }
+}
+
 pub struct GithubClient {
     client: Client,
     has_token: bool,
@@ -92,6 +134,81 @@ const DEFAULT_RETRY_DELAYS: [std::time::Duration; 6] = [
     std::time::Duration::from_secs(30),
     std::time::Duration::from_secs(60),
 ];
+const MAX_SERVER_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryDecision {
+    Return,
+    RetryAfter(std::time::Duration),
+    Fail(String),
+}
+
+fn retry_decision(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    fallback: std::time::Duration,
+    now: DateTime<Utc>,
+    max_server_wait: std::time::Duration,
+) -> RetryDecision {
+    if status.is_success() {
+        return RetryDecision::Return;
+    }
+
+    let server_wait = match status.as_u16() {
+        429 | 403 => retry_after_wait(headers, now).or_else(|| rate_limit_reset_wait(headers, now)),
+        _ => None,
+    };
+
+    if let Some(wait) = server_wait {
+        if wait > max_server_wait {
+            return RetryDecision::Fail(format!(
+                "server requested retry wait of {}s exceeds maximum {}s",
+                wait.as_secs(),
+                max_server_wait.as_secs()
+            ));
+        }
+        return RetryDecision::RetryAfter(wait);
+    }
+
+    match status.as_u16() {
+        403 => RetryDecision::Fail(
+            "permission denied or rate-limit headers were not provided".to_string(),
+        ),
+        408 | 429 | 500..=599 => RetryDecision::RetryAfter(fallback),
+        400..=499 => RetryDecision::Fail("request was rejected by GitHub".to_string()),
+        _ => RetryDecision::Return,
+    }
+}
+
+fn retry_after_wait(headers: &HeaderMap, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    let seconds = retry_at.timestamp().saturating_sub(now.timestamp()) as u64;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+fn rate_limit_reset_wait(headers: &HeaderMap, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let remaining = headers.get("x-ratelimit-remaining")?.to_str().ok()?.trim();
+    if remaining != "0" {
+        return None;
+    }
+
+    let reset = headers
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let seconds = reset.saturating_sub(now.timestamp()).max(1) as u64;
+    Some(std::time::Duration::from_secs(seconds))
+}
 
 const USER_QUERY: &str = r#"
 query($login: String!) {
@@ -289,48 +406,37 @@ impl GithubClient {
             match request_factory().send() {
                 Ok(response) => {
                     let status = response.status();
-                    if status.as_u16() == 403 {
-                        if let Some(wait) = Self::parse_rate_limit_wait(&response) {
-                            if attempt + 1 < max_attempts {
-                                let secs = wait.min(120);
-                                eprintln!(
-                                    "\nRate limited by GitHub API. Waiting {secs}s before retry (attempt {}/{})...",
-                                    attempt + 1,
-                                    max_attempts
-                                );
-                                std::thread::sleep(std::time::Duration::from_secs(secs));
-                                continue;
-                            }
+                    let fallback = self.retry_delays.get(attempt).copied().unwrap_or_default();
+                    match retry_decision(
+                        status,
+                        response.headers(),
+                        fallback,
+                        Utc::now(),
+                        MAX_SERVER_RETRY_WAIT,
+                    ) {
+                        RetryDecision::Return => return Ok(response),
+                        RetryDecision::Fail(reason) => {
                             anyhow::bail!(
-                                "GitHub {scope} request failed after {n} retries. Last status: 403.",
-                                n = max_attempts - 1
+                                "GitHub {scope} request failed with status {status}: {reason}."
                             );
                         }
-                        anyhow::bail!("GitHub {scope} request failed with status {status}.");
-                    }
+                        RetryDecision::RetryAfter(delay) => {
+                            if attempt + 1 == max_attempts {
+                                anyhow::bail!(
+                                    "GitHub {scope} request failed after {n} retries. Last status: {status}.",
+                                    n = max_attempts - 1
+                                );
+                            }
 
-                    let retryable = matches!(status.as_u16(), 408 | 429 | 500..=599);
-                    if status.is_client_error() && !retryable {
-                        anyhow::bail!("GitHub {scope} request failed with status {status}.");
+                            eprintln!(
+                                "\nGitHub {scope} request returned {status}. Retrying in {}s (attempt {}/{})...",
+                                delay.as_secs(),
+                                attempt + 1,
+                                max_attempts,
+                            );
+                            std::thread::sleep(delay);
+                        }
                     }
-                    if !retryable {
-                        return Ok(response);
-                    }
-                    if attempt + 1 == max_attempts {
-                        anyhow::bail!(
-                            "GitHub {scope} request failed after {n} retries. Last status: {status}.",
-                            n = max_attempts - 1
-                        );
-                    }
-
-                    let delay = self.retry_delays[attempt];
-                    eprintln!(
-                        "\nGitHub {scope} request returned {status}. Retrying in {}s (attempt {}/{})...",
-                        delay.as_secs(),
-                        attempt + 1,
-                        max_attempts,
-                    );
-                    std::thread::sleep(delay);
                 }
                 // Reqwest classifies a peer that accepts then closes before a response as a
                 // SendRequest (`is_request`) error instead of `is_connect()`.
@@ -420,22 +526,6 @@ impl GithubClient {
         }
     }
 
-    fn parse_rate_limit_wait(resp: &reqwest::blocking::Response) -> Option<u64> {
-        if let Some(retry_after) = resp.headers().get("retry-after")
-            && let Ok(secs) = retry_after.to_str().unwrap_or("").parse::<u64>()
-        {
-            return Some(secs);
-        }
-        if let Some(reset) = resp.headers().get("x-ratelimit-reset")
-            && let Ok(ts) = reset.to_str().unwrap_or("").parse::<i64>()
-        {
-            let now = Utc::now().timestamp();
-            let wait = (ts - now).max(1) as u64;
-            return Some(wait);
-        }
-        None
-    }
-
     pub fn get_user(&self, username: &str) -> anyhow::Result<GithubUser> {
         let variables = serde_json::json!({ "login": username });
         let data = self.graphql_query(USER_QUERY, &variables)?;
@@ -450,16 +540,42 @@ impl GithubClient {
         include_forks: bool,
         include_contributed: bool,
     ) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
+        let (payload, completeness) = self.get_contribution_payload(
+            username,
+            from,
+            until_exclusive,
+            include_forks,
+            include_contributed,
+        )?;
+        if !completeness.is_complete()
+            && let Some(warning) = completeness.visible_warning()
+        {
+            eprintln!("Warning: {warning}");
+        }
+        Ok((payload.repos, payload.summary))
+    }
+
+    fn get_contribution_payload(
+        &self,
+        username: &str,
+        from: DateTime<Utc>,
+        until_exclusive: DateTime<Utc>,
+        include_forks: bool,
+        include_contributed: bool,
+    ) -> anyhow::Result<(CachedContributionPayload, Completeness)> {
         let windows = contribution_windows(from, until_exclusive);
         let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
         let mut total_summary = ContributionSummary::default();
-        let mut has_saturated_window = false;
+        let mut incomplete_reasons = Vec::new();
 
         for (from, to) in windows {
             let variables = contribution_query_variables(username, &from, &to)?;
             let data = self.graphql_query(CONTRIBUTIONS_QUERY, &variables)?;
             let (repos, summary) = parse_contributions_collection_data(data, username)?;
-            has_saturated_window |= contribution_window_is_saturated(&repos);
+            if contribution_window_is_saturated(&repos) {
+                incomplete_reasons
+                    .push(IncompleteReason::ContributionRepositoryLimit { limit: 100 });
+            }
             total_summary.total_prs += summary.total_prs;
             total_summary.total_reviews += summary.total_reviews;
             total_summary.total_issues += summary.total_issues;
@@ -475,10 +591,6 @@ impl GithubClient {
                     merged.insert(key, (repo, commit_count));
                 }
             }
-        }
-
-        if has_saturated_window {
-            eprintln!("Warning: {}", contribution_partial_data_warning());
         }
 
         let mut repos: Vec<(RepoWithLangs, u64)> = merged.into_values().collect();
@@ -498,7 +610,20 @@ impl GithubClient {
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
-        Ok((repos, total_summary))
+        incomplete_reasons.sort();
+        incomplete_reasons.dedup();
+        let completeness = if incomplete_reasons.is_empty() {
+            Completeness::Complete
+        } else {
+            Completeness::Incomplete(incomplete_reasons)
+        };
+        Ok((
+            CachedContributionPayload {
+                repos,
+                summary: total_summary,
+            },
+            completeness,
+        ))
     }
 
     fn batch_commit_history(
@@ -506,7 +631,6 @@ impl GithubClient {
         user_node_id: &str,
         repos: &[RepoHistoryRequest],
     ) -> anyhow::Result<BatchCommitHistory> {
-        const MAX_PAGES_PER_REPO: usize = 20; // safety cap: 20 * 100 = 2000 commits per repo per window
         let mut all_commits: HashMap<String, Vec<CommitData>> = HashMap::new();
         let mut capped_repos = HashSet::new();
 
@@ -564,7 +688,7 @@ impl GithubClient {
                         parsed_repo.has_next_page,
                         parsed_repo.end_cursor.as_deref(),
                         *pages,
-                        MAX_PAGES_PER_REPO,
+                        HISTORY_MAX_PAGES_PER_REPO,
                         &scope,
                     )? {
                         PaginationDecision::Stop => {}
@@ -597,7 +721,7 @@ impl GithubClient {
         })
     }
 
-    fn resolve_single_email_result(
+    pub(crate) fn resolve_single_email_result(
         &self,
         owner: &str,
         repo: &str,
@@ -630,69 +754,123 @@ impl GithubClient {
             .map(|a| a.login.clone()))
     }
 
-    pub fn resolve_user_emails(&self, username: &str) -> anyhow::Result<Vec<String>> {
-        let repos = self.list_user_repos_graphql(username, false)?;
-        let mut emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+    pub fn resolve_user_identity(&self, login: &str) -> IdentityResolutionReport {
+        let mut report = IdentityResolutionReport {
+            login: login.to_string(),
+            emails: BTreeSet::new(),
+            repositories_examined: 0,
+            logical_requests: 1,
+            truncated_repositories: false,
+            truncated_commits: false,
+            failures: Vec::new(),
+        };
 
-        for repo in repos.iter().take(8) {
-            let mut url = reqwest::Url::parse(&format!(
+        let data = match self.graphql_query(
+            USER_REPOS_QUERY,
+            &serde_json::json!({ "login": login, "after": serde_json::Value::Null }),
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                report.failures.push(IdentityLookupFailure {
+                    repository: None,
+                    message: format!("failed to list owned repositories: {error}"),
+                });
+                return report;
+            }
+        };
+        let (repos, page_info, _) =
+            match parse_repo_connection_data(data, login, RepoConnectionKind::Owned, false) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    report.failures.push(IdentityLookupFailure {
+                        repository: None,
+                        message: format!("failed to parse owned repositories: {error}"),
+                    });
+                    return report;
+                }
+            };
+
+        report.truncated_repositories = page_info.has_next_page || repos.len() > 8;
+
+        for repo in repos.into_iter().take(8) {
+            report.repositories_examined += 1;
+            let repository = format!("{}/{}", repo.owner, repo.name);
+            let url = reqwest::Url::parse(&format!(
                 "{}/repos/{}/{}/commits",
                 self.rest_base_url.trim_end_matches('/'),
                 repo.owner,
                 repo.name
             ))
             .with_context(|| {
-                format!(
-                    "failed to build GitHub REST commit email URL for {}/{}",
-                    repo.owner, repo.name
-                )
-            })?;
+                format!("failed to build GitHub REST commit email URL for {repository}")
+            });
+            let mut url = match url {
+                Ok(url) => url,
+                Err(error) => {
+                    report.failures.push(IdentityLookupFailure {
+                        repository: Some(repository),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             url.query_pairs_mut()
-                .append_pair("author", username)
+                .append_pair("author", login)
                 .append_pair("per_page", "20");
-            match self.send_with_retry(|| self.client.get(url.clone()), "REST commit email lookup")
+            report.logical_requests += 1;
+            let response = match self
+                .send_with_retry(|| self.client.get(url.clone()), "REST commit email lookup")
             {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<Vec<serde_json::Value>>() {
-                        Ok(commits) => {
-                            for commit in commits {
-                                if let Some(email) = commit
-                                    .pointer("/commit/author/email")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|e| !e.is_empty())
-                                {
-                                    emails.insert(email.to_string());
-                                }
+                Ok(response) => response,
+                Err(error) => {
+                    report.failures.push(IdentityLookupFailure {
+                        repository: Some(repository),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                report.failures.push(IdentityLookupFailure {
+                    repository: Some(repository),
+                    message: format!(
+                        "GitHub REST commit email lookup failed with status {}",
+                        response.status()
+                    ),
+                });
+                continue;
+            }
+
+            if response
+                .headers()
+                .get("link")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("rel=\"next\""))
+            {
+                report.truncated_commits = true;
+            }
+            match response.json::<Vec<serde_json::Value>>() {
+                Ok(commits) => {
+                    for commit in commits {
+                        if let Some(email) = commit
+                            .pointer("/commit/author/email")
+                            .and_then(|value| value.as_str())
+                        {
+                            let email = canonical_email_key(email);
+                            if !email.is_empty() {
+                                report.emails.insert(email);
                             }
                         }
-                        Err(error) => eprintln!(
-                            "Warning: failed to parse commit emails for {}/{}: {error}",
-                            repo.owner, repo.name
-                        ),
                     }
                 }
-                Ok(resp) => eprintln!(
-                    "Warning: GitHub commit email lookup for {}/{} failed with status {}.",
-                    repo.owner,
-                    repo.name,
-                    resp.status()
-                ),
-                Err(error) => eprintln!(
-                    "Warning: GitHub commit email lookup for {}/{} failed: {error}",
-                    repo.owner, repo.name
-                ),
+                Err(error) => report.failures.push(IdentityLookupFailure {
+                    repository: Some(repository),
+                    message: format!("failed to parse commit emails: {error}"),
+                }),
             }
         }
 
-        if emails.is_empty() {
-            anyhow::bail!(
-                "No commit emails found for GitHub user '{username}'. The user may have no public repos or commits."
-            );
-        }
-
-        let mut sorted: Vec<String> = emails.into_iter().collect();
-        sorted.sort();
-        Ok(sorted)
+        report
     }
 
     #[allow(dead_code)]
@@ -811,30 +989,6 @@ impl GithubClient {
         }
 
         Ok((viewer_login, all_repos))
-    }
-
-    pub fn resolve_emails(
-        &self,
-        owner: &str,
-        repo: &str,
-        emails: &[String],
-    ) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        for email in emails {
-            if map.values().any(|v: &String| v == email) {
-                continue;
-            }
-            match self.resolve_single_email_result(owner, repo, email) {
-                Ok(Some(login)) => {
-                    map.insert(email.clone(), login);
-                }
-                Ok(None) => {}
-                Err(error) => eprintln!(
-                    "Warning: failed to resolve GitHub identity for '{email}' in {owner}/{repo}: {error}"
-                ),
-            }
-        }
-        map
     }
 }
 
@@ -1024,7 +1178,7 @@ struct GraphqlContributionByRepository {
     contributions: GraphqlTotalCount,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitData {
     #[serde(default)]
     pub oid: Option<String>,
@@ -1424,7 +1578,9 @@ fn repo_key(owner: &str, name: &str) -> String {
     format!("{}/{}", owner.to_lowercase(), name.to_lowercase())
 }
 
-const CACHE_SCHEMA_VERSION: &str = "v3";
+const CONTRIBUTION_CACHE_SCHEMA_VERSION: &str = "v4";
+const HISTORY_CACHE_SCHEMA_VERSION: &str = "v4";
+const HISTORY_MAX_PAGES_PER_REPO: usize = 20;
 
 #[derive(Default)]
 struct CacheWarnings {
@@ -1517,29 +1673,42 @@ fn cache_string_component(value: &str) -> String {
         .collect()
 }
 
-fn cache_optional_string_component(value: Option<&str>) -> String {
-    match value {
-        Some(value) => format!("some_{}", cache_string_component(value)),
-        None => "none".to_string(),
+fn cache_window_scope_component(scope: &CacheWindowScope) -> String {
+    match scope {
+        CacheWindowScope::Fixed {
+            from,
+            until_exclusive,
+        } => format!(
+            "fixed_{}_{}",
+            cache_string_component(&from.to_rfc3339()),
+            cache_string_component(&until_exclusive.to_rfc3339())
+        ),
+        CacheWindowScope::Rolling {
+            lookback_nanoseconds,
+        } => format!("rolling_{lookback_nanoseconds}"),
+        CacheWindowScope::Anchored { from } => {
+            format!("anchored_{}", cache_string_component(&from.to_rfc3339()))
+        }
     }
 }
 
 fn contribution_cache_key(
     user_node_id: &str,
     username: &str,
-    from: &DateTime<Utc>,
-    to: &DateTime<Utc>,
     include_forks: bool,
     include_contributed: bool,
+    include_private: bool,
+    scope: &CacheWindowScope,
 ) -> String {
+    let scope = cache_window_scope_component(scope);
     format!(
-        "{CACHE_SCHEMA_VERSION}_contribution_{}_{}_{}_{}_forks_{}_contributed_{}",
+        "{CONTRIBUTION_CACHE_SCHEMA_VERSION}_contribution_{}_{}_forks_{}_contributed_{}_private_{}_{}",
         cache_string_component(user_node_id),
-        cache_string_component(username),
-        cache_string_component(&from.to_rfc3339()),
-        cache_string_component(&to.to_rfc3339()),
+        cache_string_component(&username.to_ascii_lowercase()),
         include_forks as u8,
         include_contributed as u8,
+        include_private as u8,
+        scope,
     )
 }
 
@@ -1547,18 +1716,16 @@ fn history_cache_key(
     user_node_id: &str,
     owner: &str,
     name: &str,
-    since: Option<&str>,
-    until: Option<&str>,
     include_private: bool,
+    scope: &CacheWindowScope,
 ) -> String {
     format!(
-        "{CACHE_SCHEMA_VERSION}_history_{}_{}_{}_{}_{}_private_{}",
+        "{HISTORY_CACHE_SCHEMA_VERSION}_history_{}_{}_{}_private_{}_{}",
         cache_string_component(user_node_id),
-        cache_string_component(owner),
-        cache_string_component(name),
-        cache_optional_string_component(since),
-        cache_optional_string_component(until),
+        cache_string_component(&owner.to_ascii_lowercase()),
+        cache_string_component(&name.to_ascii_lowercase()),
         include_private as u8,
+        cache_window_scope_component(scope),
     )
 }
 
@@ -1615,24 +1782,82 @@ fn dedup_commits(mut commits: Vec<CommitData>) -> Vec<CommitData> {
     commits
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedContributionWindow {
-    repos: Vec<(RepoWithLangs, u64)>,
-    summary: ContributionSummary,
-    #[serde(default)]
-    saturated: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheEnvelope<T> {
+    pub requested_from: DateTime<Utc>,
+    pub checked_until: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub completeness: Completeness,
+    pub payload: T,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedCommitHistory {
-    since: String,
-    /// Latest committedDate among cached commits (data-derived, used as gap fetch start).
-    until: String,
-    /// Query's `until_iso` from the last cache write (used to detect if a new gap exists).
-    /// Empty string on old cache entries; falls back to `until` for backward compat.
-    #[serde(default)]
-    checked_until: String,
-    commits: Vec<CommitData>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Completeness {
+    Complete,
+    Incomplete(Vec<IncompleteReason>),
+}
+
+impl Completeness {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    fn visible_warning(&self) -> Option<String> {
+        let Self::Incomplete(reasons) = self else {
+            return None;
+        };
+        let reasons = reasons
+            .iter()
+            .map(IncompleteReason::description)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!("GitHub data may be incomplete: {reasons}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum IncompleteReason {
+    ContributionRepositoryLimit { limit: usize },
+    HistoryPageLimit { repository: String, pages: usize },
+}
+
+impl IncompleteReason {
+    fn description(&self) -> String {
+        match self {
+            Self::ContributionRepositoryLimit { limit } => {
+                format!("commitContributionsByRepository reached its {limit}-repository limit")
+            }
+            Self::HistoryPageLimit { repository, pages } => {
+                format!("commit history for {repository} reached its {pages}-page limit")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedContributionPayload {
+    pub repos: Vec<(RepoWithLangs, u64)>,
+    pub summary: ContributionSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContributionCacheDecision {
+    Hit,
+    FullFetch,
+}
+
+#[derive(Debug, Clone)]
+enum HistoryFetchPlan {
+    Hit {
+        commits: Vec<CommitData>,
+    },
+    Full {
+        request: RepoHistoryRequest,
+    },
+    Gap {
+        retained: Vec<CommitData>,
+        request: RepoHistoryRequest,
+    },
 }
 
 fn filter_commits_to_range(
@@ -1662,23 +1887,6 @@ fn filter_commits_to_range(
     Ok(filtered)
 }
 
-fn latest_commit_date(commits: &[CommitData]) -> anyhow::Result<Option<String>> {
-    let mut latest: Option<(DateTime<Utc>, String)> = None;
-
-    for commit in commits {
-        let committed_at =
-            parse_rfc3339_instant(&commit.committed_date, "cached commit committedDate")?;
-        if latest
-            .as_ref()
-            .is_none_or(|(latest_at, _)| committed_at > *latest_at)
-        {
-            latest = Some((committed_at, commit.committed_date.clone()));
-        }
-    }
-
-    Ok(latest.map(|(_, committed_date)| committed_date))
-}
-
 fn parse_rfc3339_instant(value: &str, context: &str) -> anyhow::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("{context} '{value}' is not a valid RFC3339 timestamp"))
@@ -1689,52 +1897,166 @@ fn contribution_window_is_saturated(repos: &[(RepoWithLangs, u64)]) -> bool {
     repos.len() >= 100
 }
 
-fn inactive_gap_repos(
-    to_fetch: &[RepoHistoryRequest],
-    gap_repo_keys: &HashSet<String>,
-    active: &[(RepoWithLangs, u64)],
-) -> Option<Vec<(String, String)>> {
-    if contribution_window_is_saturated(active) {
-        return None;
+fn validate_query_window_scope(query_window: &QueryWindow) -> anyhow::Result<()> {
+    if query_window.requested_from > query_window.until_exclusive {
+        anyhow::bail!("contribution query start is after its end");
     }
 
-    let active_keys: HashSet<String> = active
-        .iter()
-        .map(|(repo, _)| repo_key(&repo.owner, &repo.name))
-        .collect();
-    Some(
-        to_fetch
-            .iter()
-            .filter(|request| {
-                let key = repo_key(&request.owner, &request.name);
-                gap_repo_keys.contains(&key) && !active_keys.contains(&key)
-            })
-            .map(|request| (request.owner.clone(), request.name.clone()))
-            .collect(),
-    )
-}
-
-fn contribution_partial_data_warning() -> &'static str {
-    "GitHub contribution repository data may be partial: commitContributionsByRepository reached its 100-repository limit."
-}
-
-fn validate_cached_commit_history(history: &CachedCommitHistory) -> anyhow::Result<()> {
-    let since = parse_rfc3339_instant(&history.since, "cached history start")?;
-    let until = parse_rfc3339_instant(&history.until, "cached history end")?;
-    if since > until {
-        anyhow::bail!("cached history start is after its data end");
-    }
-
-    if !history.checked_until.is_empty() {
-        let checked_until =
-            parse_rfc3339_instant(&history.checked_until, "cached history check end")?;
-        if checked_until < until {
-            anyhow::bail!("cached history check end is before its data end");
+    match &query_window.scope {
+        CacheWindowScope::Fixed {
+            from,
+            until_exclusive,
+        } => {
+            if !query_window.completed
+                || *from != query_window.requested_from
+                || *until_exclusive != query_window.until_exclusive
+                || *until_exclusive > query_window.observed_at
+            {
+                anyhow::bail!(
+                    "fixed contribution cache scope is incompatible with its query bounds"
+                );
+            }
+        }
+        CacheWindowScope::Rolling {
+            lookback_nanoseconds,
+        } => {
+            if query_window.completed
+                || query_window.until_exclusive != query_window.observed_at
+                || *lookback_nanoseconds < 0
+            {
+                anyhow::bail!(
+                    "rolling contribution cache scope is incompatible with its query bounds"
+                );
+            }
+            let lookback = Duration::nanoseconds(*lookback_nanoseconds);
+            let expected_from = query_window
+                .observed_at
+                .checked_sub_signed(lookback)
+                .context("rolling contribution cache scope overflows its query bounds")?;
+            if expected_from != query_window.requested_from {
+                anyhow::bail!("rolling contribution cache scope does not match its query start");
+            }
+        }
+        CacheWindowScope::Anchored { from } => {
+            if query_window.completed
+                || *from != query_window.requested_from
+                || query_window.until_exclusive != query_window.observed_at
+            {
+                anyhow::bail!(
+                    "anchored contribution cache scope is incompatible with its query bounds"
+                );
+            }
         }
     }
 
-    for commit in &history.commits {
-        parse_rfc3339_instant(&commit.committed_date, "cached commit committedDate")?;
+    Ok(())
+}
+
+fn validate_envelope_bounds<T>(
+    envelope: &CacheEnvelope<T>,
+    query_window: &QueryWindow,
+) -> anyhow::Result<ContributionCacheDecision> {
+    validate_query_window_scope(query_window)?;
+    if envelope.requested_from > envelope.checked_until {
+        anyhow::bail!("cached contribution start is after its checked end");
+    }
+    if envelope.checked_until > envelope.observed_at {
+        anyhow::bail!("cached contribution checked end is after its observation time");
+    }
+
+    if !query_window.completed {
+        if envelope.observed_at > query_window.observed_at {
+            anyhow::bail!(
+                "cached contribution observation time is after the current open-window clock"
+            );
+        }
+        if envelope.checked_until != envelope.observed_at {
+            anyhow::bail!(
+                "cached open-window contribution payload extends beyond its checked coverage"
+            );
+        }
+    }
+
+    if envelope.requested_from == query_window.requested_from
+        && envelope.checked_until == query_window.until_exclusive
+    {
+        Ok(ContributionCacheDecision::Hit)
+    } else {
+        Ok(ContributionCacheDecision::FullFetch)
+    }
+}
+
+fn contribution_cache_get_or_warn(
+    cache: &DiskCache,
+    key: &str,
+    query_window: &QueryWindow,
+    warnings: &mut CacheWarnings,
+) -> Option<(
+    ContributionCacheDecision,
+    CacheEnvelope<CachedContributionPayload>,
+)> {
+    let cached = cache_get_or_warn(cache, key, warnings)?;
+    match validate_envelope_bounds(&cached, query_window) {
+        Ok(decision) => Some((decision, cached)),
+        Err(error) => {
+            warnings.push(format!(
+                "GitHub contribution cache entry for key '{key}' is invalid; treating it as a cache miss: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn validate_cached_history_envelope(
+    envelope: &CacheEnvelope<Vec<CommitData>>,
+    query_window: &QueryWindow,
+) -> anyhow::Result<()> {
+    validate_query_window_scope(query_window)?;
+    if envelope.requested_from > envelope.checked_until {
+        anyhow::bail!("cached history start is after its checked end");
+    }
+    if envelope.checked_until > envelope.observed_at {
+        anyhow::bail!("cached history checked end is after its observation time");
+    }
+
+    match &query_window.scope {
+        CacheWindowScope::Fixed {
+            from,
+            until_exclusive,
+        } => {
+            if envelope.requested_from != *from || envelope.checked_until != *until_exclusive {
+                anyhow::bail!("cached fixed history bounds are incompatible with its scope");
+            }
+        }
+        CacheWindowScope::Rolling {
+            lookback_nanoseconds,
+        } => {
+            let lookback = Duration::nanoseconds(*lookback_nanoseconds);
+            let expected_from = envelope
+                .observed_at
+                .checked_sub_signed(lookback)
+                .context("rolling history cache scope overflows its query bounds")?;
+            if envelope.requested_from != expected_from {
+                anyhow::bail!("cached rolling history scope does not match its query start");
+            }
+        }
+        CacheWindowScope::Anchored { from } => {
+            if envelope.requested_from != *from {
+                anyhow::bail!("cached anchored history scope does not match its query start");
+            }
+        }
+    }
+
+    if !query_window.completed && envelope.observed_at > query_window.observed_at {
+        anyhow::bail!("cached history observation time is after the current open-window clock");
+    }
+
+    for commit in &envelope.payload {
+        let committed_at =
+            parse_rfc3339_instant(&commit.committed_date, "cached commit committedDate")?;
+        if committed_at < envelope.requested_from || committed_at >= envelope.checked_until {
+            anyhow::bail!("cached commit committedDate is outside the envelope coverage");
+        }
     }
 
     Ok(())
@@ -1743,16 +2065,127 @@ fn validate_cached_commit_history(history: &CachedCommitHistory) -> anyhow::Resu
 fn history_cache_get_or_warn(
     cache: &DiskCache,
     key: &str,
+    query_window: &QueryWindow,
     warnings: &mut CacheWarnings,
-) -> Option<CachedCommitHistory> {
+) -> Option<CacheEnvelope<Vec<CommitData>>> {
     let cached = cache_get_or_warn(cache, key, warnings)?;
-    if let Err(error) = validate_cached_commit_history(&cached) {
+    if let Err(error) = validate_cached_history_envelope(&cached, query_window) {
         warnings.push(format!(
             "GitHub history cache entry for key '{key}' is invalid; treating it as a cache miss: {error}"
         ));
         return None;
     }
+    if let Some(warning) = cached.completeness.visible_warning() {
+        warnings.push(warning);
+    }
     Some(cached)
+}
+
+fn history_full_fetch_request(
+    query_window: &QueryWindow,
+    owner: &str,
+    name: &str,
+) -> RepoHistoryRequest {
+    RepoHistoryRequest {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        since: Some(query_window.requested_from.to_rfc3339()),
+        until_exclusive: Some(query_window.until_exclusive.to_rfc3339()),
+    }
+}
+
+fn plan_history_refresh(
+    cached: Option<CacheEnvelope<Vec<CommitData>>>,
+    query_window: &QueryWindow,
+    cache_policy: CachePolicy,
+    owner: &str,
+    name: &str,
+) -> anyhow::Result<HistoryFetchPlan> {
+    let full_fetch = || HistoryFetchPlan::Full {
+        request: history_full_fetch_request(query_window, owner, name),
+    };
+
+    if !cache_policy.can_read() {
+        return Ok(full_fetch());
+    }
+    let Some(cached) = cached else {
+        return Ok(full_fetch());
+    };
+    if !cached.completeness.is_complete()
+        || validate_cached_history_envelope(&cached, query_window).is_err()
+    {
+        return Ok(full_fetch());
+    }
+
+    if query_window.completed {
+        if cached.requested_from != query_window.requested_from
+            || cached.checked_until != query_window.until_exclusive
+        {
+            return Ok(full_fetch());
+        }
+        return Ok(HistoryFetchPlan::Hit {
+            commits: dedup_commits(filter_commits_to_range(
+                &cached.payload,
+                Some(&query_window.requested_from.to_rfc3339()),
+                Some(&query_window.until_exclusive.to_rfc3339()),
+            )?),
+        });
+    }
+
+    if cached.requested_from > query_window.requested_from {
+        return Ok(full_fetch());
+    }
+
+    let retained = dedup_commits(filter_commits_to_range(
+        &cached.payload,
+        Some(&query_window.requested_from.to_rfc3339()),
+        Some(&query_window.until_exclusive.to_rfc3339()),
+    )?);
+    if cached.checked_until < query_window.until_exclusive {
+        return Ok(HistoryFetchPlan::Gap {
+            retained,
+            request: RepoHistoryRequest {
+                owner: owner.to_string(),
+                name: name.to_string(),
+                since: Some(cached.checked_until.to_rfc3339()),
+                until_exclusive: Some(query_window.until_exclusive.to_rfc3339()),
+            },
+        });
+    }
+
+    Ok(HistoryFetchPlan::Hit { commits: retained })
+}
+
+fn finish_history_fetch(
+    plan: HistoryFetchPlan,
+    fetched: Vec<CommitData>,
+    query_window: &QueryWindow,
+    completeness: Completeness,
+) -> anyhow::Result<CacheEnvelope<Vec<CommitData>>> {
+    let (mut retained, request) = match plan {
+        HistoryFetchPlan::Full { request } => (Vec::new(), request),
+        HistoryFetchPlan::Gap { retained, request } => (retained, request),
+        HistoryFetchPlan::Hit { .. } => anyhow::bail!("cannot finish a history cache hit"),
+    };
+    let fetched = filter_commits_to_range(
+        &fetched,
+        request.since.as_deref(),
+        request.until_exclusive.as_deref(),
+    )?;
+    retained.extend(fetched);
+    let payload = dedup_commits(filter_commits_to_range(
+        &retained,
+        Some(&query_window.requested_from.to_rfc3339()),
+        Some(&query_window.until_exclusive.to_rfc3339()),
+    )?);
+
+    Ok(CacheEnvelope {
+        requested_from: query_window.requested_from,
+        checked_until: query_window.until_exclusive,
+        observed_at: query_window.observed_at,
+        completeness,
+        payload,
+    })
 }
 
 fn history_cache_write_allowed(
@@ -1762,108 +2195,73 @@ fn history_cache_write_allowed(
     !capped_repos.contains(&repo_key(&request.owner, &request.name))
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ContributionCacheRequest<'a> {
+    user_node_id: &'a str,
+    username: &'a str,
+    include_forks: bool,
+    include_contributed: bool,
+    include_private: bool,
+    query_window: &'a QueryWindow,
+    cache_policy: CachePolicy,
+}
+
 fn get_contribution_repos_cached(
     client: &GithubClient,
     cache: &DiskCache,
-    user_node_id: &str,
-    username: &str,
-    from: DateTime<Utc>,
-    until_exclusive: DateTime<Utc>,
-    include_forks: bool,
-    include_contributed: bool,
-    cache_policy: CachePolicy,
-    observed_at: DateTime<Utc>,
-    query_completed: bool,
+    request: ContributionCacheRequest<'_>,
     warnings: &mut CacheWarnings,
 ) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
-    let windows = contribution_windows(from, until_exclusive);
-    let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
-    let mut accumulated_summary = ContributionSummary::default();
+    validate_query_window_scope(request.query_window)?;
+    let key = contribution_cache_key(
+        request.user_node_id,
+        request.username,
+        request.include_forks,
+        request.include_contributed,
+        request.include_private,
+        &request.query_window.scope,
+    );
+    let cached = request
+        .cache_policy
+        .can_read()
+        .then(|| contribution_cache_get_or_warn(cache, &key, request.query_window, warnings))
+        .flatten();
 
-    for (from, to) in windows {
-        let key = contribution_cache_key(
-            user_node_id,
-            username,
-            &from,
-            &to,
-            include_forks,
-            include_contributed,
-        );
-
-        let window_completed = query_completed || to < observed_at;
-
-        let cached: Option<CachedContributionWindow> =
-            if cache_policy.can_read() && (window_completed || !cache_policy.can_write()) {
-                cache_get_or_warn(cache, &key, warnings)
-            } else {
-                None
-            };
-
-        let (repos_chunk, summary_chunk, saturated): (
-            Vec<(RepoWithLangs, u64)>,
-            ContributionSummary,
-            bool,
-        ) = if let Some(cached) = cached {
-            let saturated = cached.saturated || contribution_window_is_saturated(&cached.repos);
-            (cached.repos, cached.summary, saturated)
-        } else {
-            let variables = contribution_query_variables(username, &from, &to)?;
-            let data = client.graphql_query(CONTRIBUTIONS_QUERY, &variables)?;
-            let (repos, summary) = parse_contributions_collection_data(data, username)?;
-            let saturated = contribution_window_is_saturated(&repos);
-            if cache_policy.can_write() {
+    let (payload, completeness) = match cached {
+        Some((ContributionCacheDecision::Hit, envelope)) => {
+            (envelope.payload, envelope.completeness)
+        }
+        Some((ContributionCacheDecision::FullFetch, _)) | None => {
+            let (payload, completeness) = client.get_contribution_payload(
+                request.username,
+                request.query_window.requested_from,
+                request.query_window.until_exclusive,
+                request.include_forks,
+                request.include_contributed,
+            )?;
+            if request.cache_policy.can_write() {
                 cache_set_or_warn(
                     cache,
                     &key,
-                    &CachedContributionWindow {
-                        repos: repos.clone(),
-                        summary: summary.clone(),
-                        saturated,
+                    &CacheEnvelope {
+                        requested_from: request.query_window.requested_from,
+                        checked_until: request.query_window.until_exclusive,
+                        observed_at: request.query_window.observed_at,
+                        completeness: completeness.clone(),
+                        payload: payload.clone(),
                     },
                     warnings,
                 );
             }
-            (repos, summary, saturated)
-        };
-
-        if saturated {
-            warnings.push(contribution_partial_data_warning());
+            (payload, completeness)
         }
+    };
 
-        accumulated_summary.total_prs += summary_chunk.total_prs;
-        accumulated_summary.total_reviews += summary_chunk.total_reviews;
-        accumulated_summary.total_issues += summary_chunk.total_issues;
-
-        for (repo, commit_count) in repos_chunk {
-            let repo_id = repo_key(&repo.owner, &repo.name);
-            if let Some((existing, total)) = merged.get_mut(&repo_id) {
-                *total += commit_count;
-                if existing.languages.is_empty() && !repo.languages.is_empty() {
-                    existing.languages = repo.languages;
-                }
-            } else {
-                merged.insert(repo_id, (repo, commit_count));
-            }
-        }
+    if !completeness.is_complete()
+        && let Some(warning) = completeness.visible_warning()
+    {
+        warnings.push(warning);
     }
-
-    let mut repo_rows: Vec<(RepoWithLangs, u64)> = merged.into_values().collect();
-    if !include_forks {
-        repo_rows.retain(|(repo, _)| !repo.is_fork);
-    }
-    if !include_contributed {
-        repo_rows.retain(|(repo, _)| repo.owner.eq_ignore_ascii_case(username));
-    }
-
-    repo_rows.sort_by(|(a, _), (b, _)| {
-        a.owner
-            .to_lowercase()
-            .cmp(&b.owner.to_lowercase())
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-
-    Ok((repo_rows, accumulated_summary))
+    Ok((payload.repos, payload.summary))
 }
 
 #[allow(dead_code)]
@@ -1887,15 +2285,15 @@ pub fn fetch_user_stats(
         get_contribution_repos_cached(
             client,
             cache,
-            user_node_id,
-            username,
-            from,
-            now,
-            include_forks,
-            include_contributed,
-            cache_policy,
-            query_window.observed_at,
-            query_window.completed,
+            ContributionCacheRequest {
+                user_node_id,
+                username,
+                include_forks,
+                include_contributed,
+                include_private,
+                query_window,
+                cache_policy,
+            },
             &mut cache_warnings,
         )?
     } else {
@@ -1939,145 +2337,45 @@ pub fn fetch_user_stats(
 
     eprintln!("Found {} repos with contributions", repo_rows.len());
 
-    let until_iso = Some(now.to_rfc3339());
-    let since_iso = Some(from.to_rfc3339());
-
     let mut commit_history_by_repo: HashMap<String, Vec<CommitData>> = HashMap::new();
     let mut to_fetch: Vec<RepoHistoryRequest> = Vec::new();
-    let mut gap_repo_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut history_fetch_plans: HashMap<String, (String, HistoryFetchPlan)> = HashMap::new();
 
     for (repo, _) in &repo_rows {
         let history_key = history_cache_key(
             user_node_id,
             &repo.owner,
             &repo.name,
-            since_iso.as_deref(),
-            until_iso.as_deref(),
             include_private,
+            &query_window.scope,
         );
         let repo_name = format!("{}/{}", repo.owner, repo.name);
 
-        let cached: Option<CachedCommitHistory> = if cache_policy.can_read() {
-            cache
-                .as_ref()
-                .and_then(|c| history_cache_get_or_warn(c, &history_key, &mut cache_warnings))
+        let cached: Option<CacheEnvelope<Vec<CommitData>>> = if cache_policy.can_read() {
+            cache.as_ref().and_then(|c| {
+                history_cache_get_or_warn(c, &history_key, query_window, &mut cache_warnings)
+            })
         } else {
             None
         };
 
-        match &cached {
-            Some(ch) if cache_policy.can_write() => {
-                let overlap = filter_commits_to_range(
-                    &ch.commits,
-                    since_iso.as_deref(),
-                    until_iso.as_deref(),
-                )?;
-                let checked = if ch.checked_until.is_empty() {
-                    &ch.until
-                } else {
-                    &ch.checked_until
-                };
-                let fetch_since = until_iso
-                    .as_deref()
-                    .map(|until| {
-                        let checked_at =
-                            parse_rfc3339_instant(checked, "cached history check end")?;
-                        let until_at = parse_rfc3339_instant(until, "requested history range end")?;
-                        Ok::<_, anyhow::Error>((checked_at < until_at).then(|| ch.until.clone()))
-                    })
-                    .transpose()?
-                    .flatten();
-                commit_history_by_repo.insert(repo_name, overlap);
-                if let Some(fs) = fetch_since {
-                    gap_repo_keys.insert(repo_key(&repo.owner, &repo.name));
-                    to_fetch.push(RepoHistoryRequest {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        since: Some(fs),
-                        until_exclusive: until_iso.clone(),
-                    });
-                }
+        let plan =
+            plan_history_refresh(cached, query_window, cache_policy, &repo.owner, &repo.name)?;
+        match plan {
+            HistoryFetchPlan::Hit { commits } => {
+                commit_history_by_repo.insert(repo_name, commits);
             }
-            Some(ch) => {
-                let in_range = filter_commits_to_range(
-                    &ch.commits,
-                    since_iso.as_deref(),
-                    until_iso.as_deref(),
-                )?;
-                commit_history_by_repo.insert(repo_name, in_range);
-            }
-            None if cache_policy.can_write() => {
-                to_fetch.push(RepoHistoryRequest {
-                    owner: repo.owner.clone(),
-                    name: repo.name.clone(),
-                    since: since_iso.clone(),
-                    until_exclusive: until_iso.clone(),
-                });
-            }
-            None => {
-                to_fetch.push(RepoHistoryRequest {
-                    owner: repo.owner.clone(),
-                    name: repo.name.clone(),
-                    since: since_iso.clone(),
-                    until_exclusive: until_iso.clone(),
-                });
-            }
-        }
-    }
-
-    if !gap_repo_keys.is_empty() {
-        let min_gap_since = to_fetch
-            .iter()
-            .filter(|request| gap_repo_keys.contains(&repo_key(&request.owner, &request.name)))
-            .filter_map(|request| request.since.as_deref())
-            .min()
-            .unwrap_or("");
-        let gap_until = until_iso.as_deref().unwrap_or("");
-
-        let gap_from = parse_rfc3339_instant(min_gap_since, "contribution gap query start")?;
-        let gap_to = parse_rfc3339_instant(gap_until, "contribution gap query end")?;
-        let variables = contribution_query_variables(username, &gap_from, &gap_to)?;
-        if let Ok(data) = client.graphql_query(CONTRIBUTIONS_QUERY, &variables)
-            && let Ok((active, _)) = parse_contributions_collection_data(data, username)
-        {
-            if let Some(inactive) = inactive_gap_repos(&to_fetch, &gap_repo_keys, &active) {
-                let inactive_keys: HashSet<String> = inactive
-                    .iter()
-                    .map(|(owner, name)| repo_key(owner, name))
-                    .collect();
-                to_fetch.retain(|request| {
-                    !inactive_keys.contains(&repo_key(&request.owner, &request.name))
-                });
-
-                if cache_policy.can_write()
-                    && let Some(c) = &cache
-                {
-                    for (owner, name) in &inactive {
-                        let history_key = history_cache_key(
-                            user_node_id,
-                            owner,
-                            name,
-                            since_iso.as_deref(),
-                            until_iso.as_deref(),
-                            include_private,
-                        );
-                        if let Some(mut ch) =
-                            history_cache_get_or_warn(c, &history_key, &mut cache_warnings)
-                        {
-                            ch.checked_until = gap_until.to_string();
-                            cache_set_or_warn(c, &history_key, &ch, &mut cache_warnings);
-                        }
+            plan => {
+                let request = match &plan {
+                    HistoryFetchPlan::Full { request } | HistoryFetchPlan::Gap { request, .. } => {
+                        request.clone()
                     }
-                }
-
-                if !inactive.is_empty() {
-                    eprintln!(
-                        "Skipped {} repos with no new activity in gap period",
-                        inactive.len()
-                    );
-                }
-            } else {
-                cache_warnings.push(contribution_partial_data_warning());
+                    HistoryFetchPlan::Hit { .. } => {
+                        unreachable!("history cache hits are handled above")
+                    }
+                };
+                to_fetch.push(request);
+                history_fetch_plans.insert(repo_name, (history_key, plan));
             }
         }
     }
@@ -2088,49 +2386,39 @@ pub fn fetch_user_stats(
 
             for request in batch {
                 let repo_name = format!("{}/{}", request.owner, request.name);
-                let new_commits = filter_commits_to_range(
-                    &fetched.commits.get(&repo_name).cloned().unwrap_or_default(),
-                    request.since.as_deref(),
-                    request.until_exclusive.as_deref(),
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to filter fetched commit history for {}/{} before merge",
-                        request.owner, request.name
-                    )
-                })?;
-
-                let merged = if let Some(mut existing) = commit_history_by_repo.remove(&repo_name) {
-                    existing.extend(new_commits);
-                    dedup_commits(existing)
+                let (history_key, plan) =
+                    history_fetch_plans.remove(&repo_name).with_context(|| {
+                        format!(
+                            "missing history refresh plan for fetched repository {}/{}",
+                            request.owner, request.name
+                        )
+                    })?;
+                let completeness = if fetched
+                    .capped_repos
+                    .contains(&repo_key(&request.owner, &request.name))
+                {
+                    Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                        repository: repo_name.clone(),
+                        pages: HISTORY_MAX_PAGES_PER_REPO,
+                    }])
                 } else {
-                    new_commits
+                    Completeness::Complete
                 };
+                let envelope = finish_history_fetch(
+                    plan,
+                    fetched.commits.get(&repo_name).cloned().unwrap_or_default(),
+                    query_window,
+                    completeness,
+                )?;
 
                 if cache_policy.can_write()
                     && history_cache_write_allowed(request, &fetched.capped_repos)
+                    && envelope.completeness.is_complete()
                     && let Some(c) = &cache
                 {
-                    let history_key = history_cache_key(
-                        user_node_id,
-                        &request.owner,
-                        &request.name,
-                        since_iso.as_deref(),
-                        until_iso.as_deref(),
-                        include_private,
-                    );
-                    let default_since = since_iso.clone().unwrap_or_default();
-                    let default_until = until_iso.clone().unwrap_or_default();
-                    let data_until = latest_commit_date(&merged)?.unwrap_or(default_until.clone());
-                    let cached_entry = CachedCommitHistory {
-                        since: default_since,
-                        until: data_until,
-                        checked_until: default_until.clone(),
-                        commits: merged.clone(),
-                    };
-                    cache_set_or_warn(c, &history_key, &cached_entry, &mut cache_warnings);
+                    cache_set_or_warn(c, &history_key, &envelope, &mut cache_warnings);
                 }
-                commit_history_by_repo.insert(repo_name, merged);
+                commit_history_by_repo.insert(repo_name, envelope.payload);
             }
         }
     }
@@ -2549,25 +2837,1078 @@ mod tests {
         }
     }
 
+    fn fixed_time(day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 1, day, 0, 0, 0).unwrap()
+    }
+
+    fn response_headers(values: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in values {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn retry_decision_429_retry_after_seconds_takes_precedence() {
+        let decision = retry_decision(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &response_headers(&[
+                ("retry-after", "7"),
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1735689615"),
+            ]),
+            Duration::from_secs(1),
+            fixed_time(1),
+            Duration::from_secs(120),
+        );
+
+        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn retry_decision_429_retry_after_http_date_uses_supplied_now() {
+        let decision = retry_decision(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &response_headers(&[("retry-after", "Wed, 01 Jan 2025 00:00:09 GMT")]),
+            Duration::from_secs(1),
+            fixed_time(1),
+            Duration::from_secs(120),
+        );
+
+        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn retry_decision_permission_403_fails_without_rate_limit_signal() {
+        let decision = retry_decision(
+            reqwest::StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            Duration::from_secs(1),
+            fixed_time(1),
+            Duration::from_secs(120),
+        );
+
+        assert!(matches!(decision, RetryDecision::Fail(message) if message.contains("permission")));
+    }
+
+    #[test]
+    fn retry_decision_403_exhausted_rate_limit_uses_reset() {
+        let now = fixed_time(1);
+        let decision = retry_decision(
+            reqwest::StatusCode::FORBIDDEN,
+            &response_headers(&[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", &(now.timestamp() + 5).to_string()),
+            ]),
+            Duration::from_secs(1),
+            now,
+            Duration::from_secs(120),
+        );
+
+        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_decision_refuses_server_wait_above_bound() {
+        let decision = retry_decision(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &response_headers(&[("retry-after", "121")]),
+            Duration::from_secs(1),
+            fixed_time(1),
+            Duration::from_secs(120),
+        );
+
+        assert!(
+            matches!(decision, RetryDecision::Fail(message) if message.contains("121") && message.contains("120"))
+        );
+    }
+
+    fn rolling_for_test(observed_at: DateTime<Utc>, lookback: chrono::Duration) -> QueryWindow {
+        let requested_from = observed_at.checked_sub_signed(lookback).unwrap();
+        QueryWindow {
+            scope: CacheWindowScope::Rolling {
+                lookback_nanoseconds: lookback.num_nanoseconds().unwrap(),
+            },
+            requested_from,
+            until_exclusive: observed_at,
+            observed_at,
+            completed: false,
+        }
+    }
+
+    fn sample_for_test(name: &str, count: u64) -> CachedContributionPayload {
+        CachedContributionPayload {
+            repos: vec![(
+                RepoWithLangs {
+                    owner: "octocat".to_string(),
+                    name: name.to_string(),
+                    is_fork: false,
+                    languages: HashMap::from([("Rust".to_string(), 100)]),
+                },
+                count,
+            )],
+            summary: ContributionSummary::default(),
+        }
+    }
+
+    fn contribution_fingerprint(
+        repos: &[(RepoWithLangs, u64)],
+        summary: &ContributionSummary,
+    ) -> serde_json::Value {
+        let mut repos: Vec<_> = repos
+            .iter()
+            .map(|(repo, count)| (repo.owner.clone(), repo.name.clone(), *count))
+            .collect();
+        repos.sort();
+        serde_json::json!({
+            "repos": repos,
+            "summary": {
+                "pull_requests": summary.total_prs,
+                "reviews": summary.total_reviews,
+                "issues": summary.total_issues,
+            }
+        })
+    }
+
+    fn contribution_response_for_test(name: &str, count: u64) -> String {
+        serde_json::json!({
+            "data": {
+                "user": {
+                    "contributionsCollection": {
+                        "totalPullRequestContributions": 0,
+                        "totalPullRequestReviewContributions": 0,
+                        "totalIssueContributions": 0,
+                        "commitContributionsByRepository": [{
+                            "repository": {
+                                "name": name,
+                                "owner": { "login": "octocat" },
+                                "isFork": false,
+                                "languages": { "edges": [] }
+                            },
+                            "contributions": { "totalCount": count }
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn commit(oid: &str, committed_date: &str, additions: u64) -> CommitData {
+        commit_with_oid(Some(oid), committed_date, additions)
+    }
+
+    fn commit_with_oid(oid: Option<&str>, committed_date: &str, additions: u64) -> CommitData {
+        CommitData {
+            oid: oid.map(str::to_string),
+            additions,
+            deletions: 0,
+            committed_date: committed_date.to_string(),
+        }
+    }
+
+    fn history_request(
+        owner: &str,
+        name: &str,
+        since: &str,
+        until_exclusive: &str,
+    ) -> RepoHistoryRequest {
+        RepoHistoryRequest {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            since: Some(since.to_string()),
+            until_exclusive: Some(until_exclusive.to_string()),
+        }
+    }
+
+    #[test]
+    fn rolling_history_refresh_starts_at_checked_until_and_trims_left_edge() {
+        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
+        let cached = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(10),
+            observed_at: fixed_time(10),
+            completeness: Completeness::Complete,
+            payload: vec![
+                commit("expired", "2025-01-01T12:00:00Z", 1),
+                commit("kept", "2025-01-05T12:00:00Z", 2),
+            ],
+        };
+
+        let HistoryFetchPlan::Gap { retained, request } = plan_history_refresh(
+            Some(cached),
+            &window,
+            CachePolicy::Refresh,
+            "octocat",
+            "repo",
+        )
+        .unwrap() else {
+            panic!("expected a right-edge gap");
+        };
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|commit| commit.oid.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("kept")]
+        );
+        assert_eq!(request.since.as_deref(), Some("2025-01-10T00:00:00+00:00"));
+        assert_eq!(
+            request.until_exclusive.as_deref(),
+            Some("2025-01-11T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn empty_successful_history_gap_advances_checked_until() {
+        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
+        let plan = HistoryFetchPlan::Gap {
+            retained: vec![commit("kept", "2025-01-05T12:00:00Z", 2)],
+            request: history_request(
+                "octocat",
+                "repo",
+                "2025-01-10T00:00:00Z",
+                "2025-01-11T00:00:00Z",
+            ),
+        };
+
+        let envelope = finish_history_fetch(plan, vec![], &window, Completeness::Complete).unwrap();
+
+        assert_eq!(envelope.checked_until, window.until_exclusive);
+        assert_eq!(envelope.payload.len(), 1);
+        assert_eq!(envelope.payload[0].oid.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn readonly_incomplete_history_is_a_full_fetch_without_cache_write() {
+        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
+        let cached = CacheEnvelope {
+            requested_from: window.requested_from,
+            checked_until: window.until_exclusive,
+            observed_at: window.observed_at,
+            completeness: Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                repository: "octocat/repo".to_string(),
+                pages: 20,
+            }]),
+            payload: vec![commit("partial", "2025-01-05T12:00:00Z", 1)],
+        };
+
+        let plan = plan_history_refresh(
+            Some(cached.clone()),
+            &window,
+            CachePolicy::ReadOnly,
+            "octocat",
+            "repo",
+        )
+        .unwrap();
+
+        assert!(matches!(plan, HistoryFetchPlan::Full { .. }));
+        assert!(!CachePolicy::ReadOnly.can_write());
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(temp.path()).unwrap();
+        let key = history_cache_key("NODE", "octocat", "repo", false, &window.scope);
+        cache.set(&key, &cached).unwrap();
+        let server = start_stub(vec![StubResponse::OwnedJson {
+            status: 200,
+            body: history_response(vec![commit("fresh", "2025-01-10T12:00:00Z", 3)]),
+            delay: Duration::ZERO,
+        }]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+
+        let current = fetch_one_history_from_cache(
+            &client,
+            &cache,
+            "NODE",
+            "octocat",
+            "repo",
+            &window,
+            CachePolicy::ReadOnly,
+        )
+        .unwrap();
+
+        assert_eq!(current[0].oid.as_deref(), Some("fresh"));
+        assert_eq!(
+            graphql_variables(&server.finish()[0])["since0"],
+            "2025-01-02T00:00:00+00:00"
+        );
+        let persisted = cache
+            .get::<CacheEnvelope<Vec<CommitData>>>(&key)
+            .unwrap()
+            .unwrap();
+        assert!(!persisted.completeness.is_complete());
+        assert_eq!(persisted.payload[0].oid.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn history_dedup_only_collapses_nonempty_oids() {
+        let commits = dedup_commits(vec![
+            commit("same", "2025-01-05T00:00:00Z", 1),
+            commit("same", "2025-01-05T00:00:00Z", 1),
+            commit_with_oid(None, "2025-01-06T00:00:00Z", 2),
+            commit_with_oid(None, "2025-01-06T00:00:00Z", 2),
+            commit_with_oid(Some(""), "2025-01-07T00:00:00Z", 3),
+            commit_with_oid(Some(""), "2025-01-07T00:00:00Z", 3),
+        ]);
+
+        assert_eq!(commits.len(), 5);
+        assert_eq!(
+            commits
+                .iter()
+                .filter(|commit| commit.oid.as_deref().is_none_or(str::is_empty))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn malformed_incomplete_or_clock_rollback_history_plans_full_fetch() {
+        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(temp.path()).unwrap();
+
+        let malformed = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(10),
+            observed_at: fixed_time(10),
+            completeness: Completeness::Complete,
+            payload: vec![commit("bad", "not-a-timestamp", 1)],
+        };
+        cache.set("malformed-history", &malformed).unwrap();
+        let mut malformed_warnings = CacheWarnings::default();
+        let malformed_cached = history_cache_get_or_warn(
+            &cache,
+            "malformed-history",
+            &window,
+            &mut malformed_warnings,
+        );
+        assert!(matches!(
+            plan_history_refresh(
+                malformed_cached,
+                &window,
+                CachePolicy::ReadOnly,
+                "octocat",
+                "repo",
+            )
+            .unwrap(),
+            HistoryFetchPlan::Full { .. }
+        ));
+        assert_eq!(malformed_warnings.messages.len(), 1);
+
+        let incomplete: CacheEnvelope<Vec<CommitData>> = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(10),
+            observed_at: fixed_time(10),
+            completeness: Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                repository: "octocat/repo".to_string(),
+                pages: 20,
+            }]),
+            payload: vec![],
+        };
+        cache.set("incomplete-history", &incomplete).unwrap();
+        let mut incomplete_warnings = CacheWarnings::default();
+        let incomplete_cached = history_cache_get_or_warn(
+            &cache,
+            "incomplete-history",
+            &window,
+            &mut incomplete_warnings,
+        );
+        assert!(matches!(
+            plan_history_refresh(
+                incomplete_cached,
+                &window,
+                CachePolicy::ReadOnly,
+                "octocat",
+                "repo",
+            )
+            .unwrap(),
+            HistoryFetchPlan::Full { .. }
+        ));
+        assert_eq!(incomplete_warnings.messages.len(), 1);
+
+        let clock_rollback: CacheEnvelope<Vec<CommitData>> = CacheEnvelope {
+            requested_from: fixed_time(3),
+            checked_until: fixed_time(12),
+            observed_at: fixed_time(12),
+            completeness: Completeness::Complete,
+            payload: vec![],
+        };
+        cache
+            .set("clock-rollback-history", &clock_rollback)
+            .unwrap();
+        let mut rollback_warnings = CacheWarnings::default();
+        let rollback_cached = history_cache_get_or_warn(
+            &cache,
+            "clock-rollback-history",
+            &window,
+            &mut rollback_warnings,
+        );
+        assert!(matches!(
+            plan_history_refresh(
+                rollback_cached,
+                &window,
+                CachePolicy::ReadOnly,
+                "octocat",
+                "repo",
+            )
+            .unwrap(),
+            HistoryFetchPlan::Full { .. }
+        ));
+        assert_eq!(rollback_warnings.messages.len(), 1);
+    }
+
+    #[test]
+    fn capped_history_envelope_is_incomplete_not_complete() {
+        let envelope = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(2),
+            observed_at: fixed_time(2),
+            completeness: Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                repository: "octocat/repo".to_string(),
+                pages: 20,
+            }]),
+            payload: vec![commit("partial", "2025-01-01T12:00:00Z", 1)],
+        };
+
+        let roundtrip: CacheEnvelope<Vec<CommitData>> =
+            serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+
+        assert!(!roundtrip.completeness.is_complete());
+        assert_eq!(
+            roundtrip.completeness,
+            Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                repository: "octocat/repo".to_string(),
+                pages: 20,
+            }])
+        );
+    }
+
+    fn history_response(commits: Vec<CommitData>) -> String {
+        let total_count = commits.len();
+        let nodes: Vec<serde_json::Value> = commits
+            .into_iter()
+            .map(|commit| {
+                json!({
+                    "oid": commit.oid,
+                    "additions": commit.additions,
+                    "deletions": commit.deletions,
+                    "committedDate": commit.committed_date,
+                })
+            })
+            .collect();
+        json!({
+            "data": {
+                "repo0": {
+                    "defaultBranchRef": {
+                        "target": {
+                            "history": {
+                                "nodes": nodes,
+                                "totalCount": total_count,
+                                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn graphql_variables(request: &str) -> serde_json::Value {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["variables"].clone()
+    }
+
+    fn seed_complete_history(
+        cache: &DiskCache,
+        user_node_id: &str,
+        owner: &str,
+        name: &str,
+        include_private: bool,
+        window: &QueryWindow,
+        commits: Vec<CommitData>,
+    ) {
+        let key = history_cache_key(user_node_id, owner, name, include_private, &window.scope);
+        cache
+            .set(
+                &key,
+                &CacheEnvelope {
+                    requested_from: window.requested_from,
+                    checked_until: window.until_exclusive,
+                    observed_at: window.observed_at,
+                    completeness: Completeness::Complete,
+                    payload: commits,
+                },
+            )
+            .unwrap();
+    }
+
+    fn fetch_one_history_from_cache(
+        client: &GithubClient,
+        cache: &DiskCache,
+        user_node_id: &str,
+        owner: &str,
+        name: &str,
+        window: &QueryWindow,
+        cache_policy: CachePolicy,
+    ) -> anyhow::Result<Vec<CommitData>> {
+        let key = history_cache_key(user_node_id, owner, name, false, &window.scope);
+        let mut warnings = CacheWarnings::default();
+        let cached = history_cache_get_or_warn(cache, &key, window, &mut warnings);
+        let plan = plan_history_refresh(cached, window, cache_policy, owner, name)?;
+
+        let (HistoryFetchPlan::Full { request } | HistoryFetchPlan::Gap { request, .. }) = &plan
+        else {
+            unreachable!("a test refresh with an uncovered window must fetch")
+        };
+        let fetched = client.batch_commit_history(user_node_id, std::slice::from_ref(request))?;
+        let repository = repo_key(owner, name);
+        let completeness = if fetched.capped_repos.contains(&repository) {
+            Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
+                repository: format!("{owner}/{name}"),
+                pages: 20,
+            }])
+        } else {
+            Completeness::Complete
+        };
+        let commits = fetched
+            .commits
+            .get(&repository)
+            .cloned()
+            .unwrap_or_default();
+        let envelope = finish_history_fetch(plan, commits, window, completeness)?;
+        if cache_policy.can_write() && envelope.completeness.is_complete() {
+            cache.set(&key, &envelope)?;
+        }
+        Ok(envelope.payload)
+    }
+
+    fn refresh_one_history(
+        client: &GithubClient,
+        cache: &DiskCache,
+        user_node_id: &str,
+        owner: &str,
+        name: &str,
+        window: &QueryWindow,
+    ) -> anyhow::Result<Vec<CommitData>> {
+        fetch_one_history_from_cache(
+            client,
+            cache,
+            user_node_id,
+            owner,
+            name,
+            window,
+            CachePolicy::Refresh,
+        )
+    }
+
+    fn fetch_one_history_without_cache(
+        client: &GithubClient,
+        user_node_id: &str,
+        owner: &str,
+        name: &str,
+        window: &QueryWindow,
+    ) -> anyhow::Result<Vec<CommitData>> {
+        let request = RepoHistoryRequest {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            since: Some(window.requested_from.to_rfc3339()),
+            until_exclusive: Some(window.until_exclusive.to_rfc3339()),
+        };
+        let fetched = client.batch_commit_history(user_node_id, std::slice::from_ref(&request))?;
+        let repository = repo_key(owner, name);
+        let commits = fetched
+            .commits
+            .get(&repository)
+            .cloned()
+            .unwrap_or_default();
+        Ok(finish_history_fetch(
+            HistoryFetchPlan::Full { request },
+            commits,
+            window,
+            Completeness::Complete,
+        )?
+        .payload)
+    }
+
+    #[test]
+    fn second_rolling_history_refresh_fetches_only_gap_and_matches_fresh_result() {
+        let first_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let second_window = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(temp.path()).unwrap();
+        seed_complete_history(
+            &cache,
+            "NODE",
+            "octocat",
+            "repo",
+            false,
+            &first_window,
+            vec![
+                commit("old", "2025-01-01T12:00:00Z", 1),
+                commit("kept", "2025-01-05T12:00:00Z", 2),
+            ],
+        );
+        let server = start_stub(vec![StubResponse::OwnedJson {
+            status: 200,
+            body: history_response(vec![commit("new", "2025-01-08T12:00:00Z", 3)]),
+            delay: Duration::ZERO,
+        }]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+
+        let refreshed =
+            refresh_one_history(&client, &cache, "NODE", "octocat", "repo", &second_window)
+                .unwrap();
+        let requests = server.finish();
+        let variables = graphql_variables(&requests[0]);
+        assert_eq!(variables["since0"], "2025-01-08T00:00:00+00:00");
+        assert_eq!(variables["until0"], "2025-01-09T00:00:00+00:00");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|commit| commit.oid.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("kept"), Some("new")]
+        );
+
+        let fresh_server = start_stub(vec![StubResponse::OwnedJson {
+            status: 200,
+            body: history_response(vec![
+                commit("kept", "2025-01-05T12:00:00Z", 2),
+                commit("new", "2025-01-08T12:00:00Z", 3),
+            ]),
+            delay: Duration::ZERO,
+        }]);
+        let fresh_client =
+            GithubClient::for_test(&fresh_server.base_url, Vec::new(), Duration::from_secs(1));
+        let fresh = fetch_one_history_without_cache(
+            &fresh_client,
+            "NODE",
+            "octocat",
+            "repo",
+            &second_window,
+        )
+        .unwrap();
+
+        assert_eq!(refreshed, fresh);
+        let fresh_requests = fresh_server.finish();
+        assert_eq!(fresh_requests.len(), 1);
+        let fresh_variables = graphql_variables(&fresh_requests[0]);
+        assert_eq!(fresh_variables["since0"], "2025-01-02T00:00:00+00:00");
+        assert_eq!(fresh_variables["until0"], "2025-01-09T00:00:00+00:00");
+    }
+
+    #[test]
+    fn readonly_rolling_history_gap_fetches_current_result_without_cache_write() {
+        let first_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let second_window = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(temp.path()).unwrap();
+        seed_complete_history(
+            &cache,
+            "NODE",
+            "octocat",
+            "repo",
+            false,
+            &first_window,
+            vec![
+                commit("old", "2025-01-01T12:00:00Z", 1),
+                commit("kept", "2025-01-05T12:00:00Z", 2),
+            ],
+        );
+        let server = start_stub(vec![StubResponse::OwnedJson {
+            status: 200,
+            body: history_response(vec![commit("new", "2025-01-08T12:00:00Z", 3)]),
+            delay: Duration::ZERO,
+        }]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+
+        let current = fetch_one_history_from_cache(
+            &client,
+            &cache,
+            "NODE",
+            "octocat",
+            "repo",
+            &second_window,
+            CachePolicy::ReadOnly,
+        )
+        .unwrap();
+
+        assert_eq!(
+            current
+                .iter()
+                .map(|commit| commit.oid.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("kept"), Some("new")]
+        );
+        let variables = graphql_variables(&server.finish()[0]);
+        assert_eq!(variables["since0"], "2025-01-08T00:00:00+00:00");
+        assert_eq!(variables["until0"], "2025-01-09T00:00:00+00:00");
+
+        let key = history_cache_key("NODE", "octocat", "repo", false, &first_window.scope);
+        let persisted = cache
+            .get::<CacheEnvelope<Vec<CommitData>>>(&key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted
+                .payload
+                .iter()
+                .map(|commit| commit.oid.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("old"), Some("kept")]
+        );
+    }
+
+    #[test]
+    fn v4_rolling_keys_are_stable_across_observation_time_and_v3_files_naturally_miss() {
+        let first = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let second = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
+        let first_key =
+            contribution_cache_key("node-octocat", "OctoCat", false, false, false, &first.scope);
+        let second_key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &second.scope,
+        );
+        let legacy_key = first_key.replacen("v4_", "v3_", 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(tmp.path()).unwrap();
+        cache
+            .set(&legacy_key, &serde_json::json!({ "legacy": true }))
+            .unwrap();
+
+        assert_eq!(first_key, second_key);
+        assert!(first_key.starts_with("v4_contribution_"));
+        assert!(
+            cache
+                .get::<CacheEnvelope<CachedContributionPayload>>(&first_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(tmp.path().join(format!("{legacy_key}.json")).is_file());
+    }
+
+    #[test]
+    fn changed_open_contribution_bounds_require_full_refetch_not_gap_merge() {
+        let old_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let new_window = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
+        let old_envelope = CacheEnvelope {
+            requested_from: old_window.requested_from,
+            checked_until: old_window.until_exclusive,
+            observed_at: old_window.observed_at,
+            completeness: Completeness::Complete,
+            payload: sample_for_test("old-repo", 99),
+        };
+
+        assert_eq!(
+            validate_envelope_bounds(&old_envelope, &new_window).unwrap(),
+            ContributionCacheDecision::FullFetch
+        );
+    }
+
+    #[test]
+    fn envelope_bounds_reject_invalid_coverage_clocks_and_scope() {
+        let fixed_window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from: fixed_time(1),
+                until_exclusive: fixed_time(2),
+            },
+            requested_from: fixed_time(1),
+            until_exclusive: fixed_time(2),
+            observed_at: fixed_time(3),
+            completed: true,
+        };
+        let payload = sample_for_test("repo", 1);
+        let invalid_start = CacheEnvelope {
+            requested_from: fixed_time(2),
+            checked_until: fixed_time(1),
+            observed_at: fixed_time(3),
+            completeness: Completeness::Complete,
+            payload: payload.clone(),
+        };
+        let invalid_check = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(3),
+            observed_at: fixed_time(2),
+            completeness: Completeness::Complete,
+            payload: payload.clone(),
+        };
+        assert!(validate_envelope_bounds(&invalid_start, &fixed_window).is_err());
+        assert!(validate_envelope_bounds(&invalid_check, &fixed_window).is_err());
+
+        let rolling_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let clock_rollback = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(9),
+            observed_at: fixed_time(9),
+            completeness: Completeness::Complete,
+            payload: payload.clone(),
+        };
+        let payload_beyond_coverage = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(7),
+            observed_at: fixed_time(8),
+            completeness: Completeness::Complete,
+            payload,
+        };
+        assert!(validate_envelope_bounds(&clock_rollback, &rolling_window).is_err());
+        assert!(validate_envelope_bounds(&payload_beyond_coverage, &rolling_window).is_err());
+
+        let incompatible_scope = QueryWindow {
+            completed: false,
+            ..fixed_window
+        };
+        let valid_fixed = CacheEnvelope {
+            requested_from: fixed_time(1),
+            checked_until: fixed_time(2),
+            observed_at: fixed_time(3),
+            completeness: Completeness::Complete,
+            payload: sample_for_test("repo", 1),
+        };
+        assert!(validate_envelope_bounds(&valid_fixed, &incompatible_scope).is_err());
+    }
+
+    #[test]
+    fn incomplete_contribution_never_claims_complete_and_replays_reason() {
+        let window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &window.scope,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(tmp.path()).unwrap();
+        let completeness =
+            Completeness::Incomplete(vec![IncompleteReason::ContributionRepositoryLimit {
+                limit: 100,
+            }]);
+        cache
+            .set(
+                &key,
+                &CacheEnvelope {
+                    requested_from: window.requested_from,
+                    checked_until: window.until_exclusive,
+                    observed_at: window.observed_at,
+                    completeness: completeness.clone(),
+                    payload: sample_for_test("limited", 100),
+                },
+            )
+            .unwrap();
+        let client =
+            GithubClient::for_test("http://127.0.0.1:1", Vec::new(), Duration::from_secs(1));
+        let mut warnings = CacheWarnings::default();
+
+        let (repos, _) = get_contribution_repos_cached(
+            &client,
+            &cache,
+            ContributionCacheRequest {
+                user_node_id: "node-octocat",
+                username: "octocat",
+                include_forks: false,
+                include_contributed: false,
+                include_private: false,
+                query_window: &window,
+                cache_policy: CachePolicy::ReadOnly,
+            },
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(!completeness.is_complete());
+        assert_eq!(repos[0].0.name, "limited");
+        assert_eq!(
+            warnings.messages,
+            vec![completeness.visible_warning().unwrap()]
+        );
+    }
+
+    #[test]
+    fn rolling_contribution_refresh_requests_the_exact_new_full_window() {
+        let old_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let new_window = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(tmp.path()).unwrap();
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &new_window.scope,
+        );
+        cache
+            .set(
+                &key,
+                &CacheEnvelope {
+                    requested_from: old_window.requested_from,
+                    checked_until: old_window.until_exclusive,
+                    observed_at: old_window.observed_at,
+                    completeness: Completeness::Complete,
+                    payload: sample_for_test("old-repo", 99),
+                },
+            )
+            .unwrap();
+        let new_response = contribution_response_for_test("new-repo", 3);
+        let server = start_stub(vec![
+            StubResponse::OwnedJson {
+                status: 200,
+                body: new_response.clone(),
+                delay: Duration::ZERO,
+            },
+            StubResponse::OwnedJson {
+                status: 200,
+                body: new_response,
+                delay: Duration::ZERO,
+            },
+        ]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+        let mut warnings = CacheWarnings::default();
+
+        let refreshed = get_contribution_repos_cached(
+            &client,
+            &cache,
+            ContributionCacheRequest {
+                user_node_id: "node-octocat",
+                username: "octocat",
+                include_forks: false,
+                include_contributed: false,
+                include_private: false,
+                query_window: &new_window,
+                cache_policy: CachePolicy::Refresh,
+            },
+            &mut warnings,
+        )
+        .unwrap();
+        let refreshed_envelope = cache
+            .get::<CacheEnvelope<CachedContributionPayload>>(&key)
+            .unwrap()
+            .unwrap();
+        let fresh = client
+            .get_contribution_repos(
+                "octocat",
+                new_window.requested_from,
+                new_window.until_exclusive,
+                false,
+                false,
+            )
+            .unwrap();
+        let requests = server.finish();
+        let variables: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|request| {
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["variables"].clone()
+            })
+            .collect();
+
+        assert_eq!(requests.len(), 2);
+        for request in variables {
+            assert_eq!(request["from"], "2025-01-02T00:00:00+00:00");
+            assert_eq!(request["to"], "2025-01-08T23:59:59.999999999+00:00");
+        }
+        assert_eq!(refreshed.0.len(), 1);
+        assert_eq!(refreshed.0[0].0.name, "new-repo");
+        assert_eq!(refreshed.0[0].1, 3);
+        assert_eq!(refreshed_envelope.requested_from, new_window.requested_from);
+        assert_eq!(refreshed_envelope.checked_until, new_window.until_exclusive);
+        assert_eq!(refreshed_envelope.payload.repos[0].0.name, "new-repo");
+        assert_eq!(
+            contribution_fingerprint(&refreshed.0, &refreshed.1),
+            contribution_fingerprint(&fresh.0, &fresh.1)
+        );
+        assert!(warnings.messages.is_empty());
+    }
+
+    #[test]
+    fn read_only_contribution_miss_fetches_without_writing_an_envelope() {
+        let window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(tmp.path()).unwrap();
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &window.scope,
+        );
+        let server = start_stub(vec![StubResponse::OwnedJson {
+            status: 200,
+            body: contribution_response_for_test("fresh-repo", 1),
+            delay: Duration::ZERO,
+        }]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+        let mut warnings = CacheWarnings::default();
+
+        let (repos, _) = get_contribution_repos_cached(
+            &client,
+            &cache,
+            ContributionCacheRequest {
+                user_node_id: "node-octocat",
+                username: "octocat",
+                include_forks: false,
+                include_contributed: false,
+                include_private: false,
+                query_window: &window,
+                cache_policy: CachePolicy::ReadOnly,
+            },
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(repos[0].0.name, "fresh-repo");
+        assert!(
+            cache
+                .get::<CacheEnvelope<CachedContributionPayload>>(&key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server.finish().len(), 1);
+        assert!(warnings.messages.is_empty());
+    }
+
     #[test]
     fn history_cache_key_is_user_scoped_and_component_collision_free() {
-        let since = Some("2025-01-01T00:00:00Z");
-        let until = Some("2025-02-01T00:00:00Z");
-        let alice = history_cache_key("node-alice", "octo/org", "repo", since, until, false);
-        let bob = history_cache_key("node-bob", "octo/org", "repo", since, until, false);
-        let slash = history_cache_key("node-alice", "octo/org", "repo", since, until, false);
-        let underscore = history_cache_key("node-alice", "octo_org", "repo", since, until, false);
+        let first_window = rolling_for_test(fixed_time(8), chrono::Duration::days(31));
+        let second_window = rolling_for_test(fixed_time(9), chrono::Duration::days(31));
+        let alice = history_cache_key("node-alice", "Octo/Org", "Repo", false, &first_window.scope);
+        let alice_lower = history_cache_key(
+            "node-alice",
+            "octo/org",
+            "repo",
+            false,
+            &second_window.scope,
+        );
+        let bob = history_cache_key("node-bob", "octo/org", "repo", false, &first_window.scope);
+        let slash = history_cache_key("node-alice", "octo/org", "repo", false, &first_window.scope);
+        let underscore =
+            history_cache_key("node-alice", "octo_org", "repo", false, &first_window.scope);
         let different_range = history_cache_key(
             "node-alice",
             "octo/org",
             "repo",
-            Some("2025-01-02T00:00:00Z"),
-            until,
             false,
+            &CacheWindowScope::Rolling {
+                lookback_nanoseconds: chrono::Duration::days(30).num_nanoseconds().unwrap(),
+            },
         );
-        let private = history_cache_key("node-alice", "octo/org", "repo", since, until, true);
+        let private =
+            history_cache_key("node-alice", "octo/org", "repo", true, &first_window.scope);
 
-        assert!(alice.starts_with("v3_"));
+        assert!(alice.starts_with("v4_"));
+        assert_eq!(alice, alice_lower);
         assert_ne!(alice, bob);
         assert_ne!(slash, underscore);
         assert_ne!(alice, different_range);
@@ -2575,24 +3916,31 @@ mod tests {
 
         let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let scope = CacheWindowScope::Fixed {
+            from,
+            until_exclusive: to,
+        };
         let contribution =
-            contribution_cache_key("node-alice", "octo/org", &from, &to, false, false);
+            contribution_cache_key("node-alice", "octo/org", false, false, false, &scope);
         let contribution_user =
-            contribution_cache_key("node-bob", "octo/org", &from, &to, false, false);
+            contribution_cache_key("node-bob", "octo/org", false, false, false, &scope);
         let contribution_component =
-            contribution_cache_key("node-alice", "octo_org", &from, &to, false, false);
+            contribution_cache_key("node-alice", "octo_org", false, false, false, &scope);
         let contribution_range = contribution_cache_key(
             "node-alice",
             "octo/org",
-            &from,
-            &Utc.with_ymd_and_hms(2025, 2, 2, 0, 0, 0).unwrap(),
             false,
             false,
+            false,
+            &CacheWindowScope::Fixed {
+                from,
+                until_exclusive: Utc.with_ymd_and_hms(2025, 2, 2, 0, 0, 0).unwrap(),
+            },
         );
         let contribution_mode =
-            contribution_cache_key("node-alice", "octo/org", &from, &to, true, true);
+            contribution_cache_key("node-alice", "octo/org", true, true, true, &scope);
 
-        assert!(contribution.starts_with("v3_"));
+        assert!(contribution.starts_with("v4_"));
         assert_ne!(contribution, contribution_user);
         assert_ne!(contribution, contribution_component);
         assert_ne!(contribution, contribution_range);
@@ -2613,81 +3961,78 @@ mod tests {
     }
 
     #[test]
-    fn v2_cache_entries_are_misses_for_v3_contribution_and_history_keys() {
+    fn older_cache_entries_are_misses_for_v4_contribution_and_v4_history_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let from = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap();
-        let contribution_key =
-            contribution_cache_key("node-octocat", "octocat", &from, &to, false, false);
+        let contribution_scope = CacheWindowScope::Fixed {
+            from,
+            until_exclusive: to,
+        };
+        let contribution_key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &contribution_scope,
+        );
         let history_key = history_cache_key(
             "node-octocat",
             "octocat",
             "hello-world",
-            Some("2020-01-01T00:00:00Z"),
-            Some("2020-01-02T00:00:00Z"),
             false,
+            &contribution_scope,
         );
-        let v2_contribution_key = contribution_key.replacen("v3_", "v2_", 1);
-        let v2_history_key = history_key.replacen("v3_", "v2_", 1);
+        let v3_contribution_key = contribution_key.replacen("v4_", "v3_", 1);
+        let v3_history_key = history_key.replacen("v4_", "v3_", 1);
 
         cache
-            .set(
-                &v2_contribution_key,
-                &CachedContributionWindow {
-                    repos: vec![(sample_repo(), 1)],
-                    summary: ContributionSummary::default(),
-                    saturated: false,
-                },
-            )
+            .set(&v3_contribution_key, &serde_json::json!({ "legacy": true }))
             .unwrap();
         cache
-            .set(
-                &v2_history_key,
-                &CachedCommitHistory {
-                    since: "2020-01-01T00:00:00Z".to_string(),
-                    until: "2020-01-02T00:00:00Z".to_string(),
-                    checked_until: "2020-01-02T00:00:00Z".to_string(),
-                    commits: vec![],
-                },
-            )
+            .set(&v3_history_key, &serde_json::json!({ "legacy": true }))
             .unwrap();
 
         assert!(
             cache
-                .get::<CachedContributionWindow>(&contribution_key)
+                .get::<CacheEnvelope<CachedContributionPayload>>(&contribution_key)
                 .unwrap()
                 .is_none(),
-            "current contribution key must not load a v2 payload"
+            "current contribution key must not load a v3 payload"
         );
         assert!(
             cache
-                .get::<CachedCommitHistory>(&history_key)
+                .get::<CacheEnvelope<Vec<CommitData>>>(&history_key)
                 .unwrap()
                 .is_none(),
-            "current history key must not load a v2 payload"
+            "current history key must not load a v3 payload"
         );
-        assert!(contribution_key.starts_with("v3_"));
-        assert!(history_key.starts_with("v3_"));
+        assert!(contribution_key.starts_with("v4_"));
+        assert!(history_key.starts_with("v4_"));
 
         cache
             .set(
                 &contribution_key,
-                &CachedContributionWindow {
-                    repos: vec![(sample_repo(), 7)],
-                    summary: ContributionSummary::default(),
-                    saturated: false,
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: sample_for_test("hello-world", 7),
                 },
             )
             .unwrap();
         cache
             .set(
                 &history_key,
-                &CachedCommitHistory {
-                    since: "2020-01-01T00:00:00Z".to_string(),
-                    until: "2020-01-02T00:00:00Z".to_string(),
-                    checked_until: "2020-01-02T00:00:00Z".to_string(),
-                    commits: vec![CommitData {
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: vec![CommitData {
                         oid: Some("current".to_string()),
                         additions: 7,
                         deletions: 0,
@@ -2698,15 +4043,15 @@ mod tests {
             .unwrap();
 
         let contribution = cache
-            .get::<CachedContributionWindow>(&contribution_key)
+            .get::<CacheEnvelope<CachedContributionPayload>>(&contribution_key)
             .unwrap()
             .unwrap();
         let history = cache
-            .get::<CachedCommitHistory>(&history_key)
+            .get::<CacheEnvelope<Vec<CommitData>>>(&history_key)
             .unwrap()
             .unwrap();
-        assert_eq!(contribution.repos[0].1, 7);
-        assert_eq!(history.commits[0].oid.as_deref(), Some("current"));
+        assert_eq!(contribution.payload.repos[0].1, 7);
+        assert_eq!(history.payload[0].oid.as_deref(), Some("current"));
     }
 
     #[test]
@@ -2715,7 +4060,24 @@ mod tests {
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let from = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap();
-        let key = contribution_cache_key("node-octocat", "octocat", &from, &to, false, false);
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &window.scope,
+        );
         let expected_summary = ContributionSummary {
             total_prs: 3,
             total_reviews: 5,
@@ -2724,10 +4086,15 @@ mod tests {
         cache
             .set(
                 &key,
-                &CachedContributionWindow {
-                    repos: vec![(sample_repo(), 11)],
-                    summary: expected_summary.clone(),
-                    saturated: false,
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: CachedContributionPayload {
+                        repos: vec![(sample_repo(), 11)],
+                        summary: expected_summary.clone(),
+                    },
                 },
             )
             .unwrap();
@@ -2738,15 +4105,15 @@ mod tests {
         let (repos, summary) = get_contribution_repos_cached(
             &client,
             &cache,
-            "node-octocat",
-            "octocat",
-            from,
-            to,
-            false,
-            false,
-            CachePolicy::ReadOnly,
-            to,
-            true,
+            ContributionCacheRequest {
+                user_node_id: "node-octocat",
+                username: "octocat",
+                include_forks: false,
+                include_contributed: false,
+                include_private: false,
+                query_window: &window,
+                cache_policy: CachePolicy::ReadOnly,
+            },
             &mut warnings,
         )
         .unwrap();
@@ -2768,17 +4135,20 @@ mod tests {
         let server = start_stub(vec![
             StubResponse::Json {
                 status: 200,
-                body: contribution_response,
+                body: contribution_response.to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             StubResponse::Json {
                 status: 200,
-                body: contribution_response,
+                body: contribution_response.to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             StubResponse::Json {
                 status: 200,
-                body: contribution_response,
+                body: contribution_response.to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
         ]);
@@ -2813,15 +4183,19 @@ mod tests {
 
     #[test]
     fn contribution_repository_cap_sets_replayable_partial_warning_state() {
-        let repos = vec![(sample_repo(), 1); 100];
+        let completeness =
+            Completeness::Incomplete(vec![IncompleteReason::ContributionRepositoryLimit {
+                limit: 100,
+            }]);
         let mut warnings = CacheWarnings::default();
 
-        if contribution_window_is_saturated(&repos) {
-            warnings.push(contribution_partial_data_warning());
+        if let Some(warning) = completeness.visible_warning() {
+            warnings.push(warning);
         }
 
-        assert!(contribution_window_is_saturated(&repos));
-        assert_eq!(warnings.messages, vec![contribution_partial_data_warning()]);
+        assert!(!completeness.is_complete());
+        assert_eq!(warnings.messages.len(), 1);
+        assert!(warnings.messages[0].contains("100-repository limit"));
     }
 
     #[test]
@@ -2830,14 +4204,38 @@ mod tests {
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let from = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap();
-        let key = contribution_cache_key("node-octocat", "octocat", &from, &to, false, false);
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &window.scope,
+        );
         cache
             .set(
                 &key,
-                &CachedContributionWindow {
-                    repos: vec![(sample_repo(), 100)],
-                    summary: ContributionSummary::default(),
-                    saturated: true,
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Incomplete(vec![
+                        IncompleteReason::ContributionRepositoryLimit { limit: 100 },
+                    ]),
+                    payload: CachedContributionPayload {
+                        repos: vec![(sample_repo(), 100)],
+                        summary: ContributionSummary::default(),
+                    },
                 },
             )
             .unwrap();
@@ -2848,15 +4246,15 @@ mod tests {
         let (repos, summary) = get_contribution_repos_cached(
             &client,
             &cache,
-            "node-octocat",
-            "octocat",
-            from,
-            to,
-            false,
-            false,
-            CachePolicy::ReadOnly,
-            to,
-            true,
+            ContributionCacheRequest {
+                user_node_id: "node-octocat",
+                username: "octocat",
+                include_forks: false,
+                include_contributed: false,
+                include_private: false,
+                query_window: &window,
+                cache_policy: CachePolicy::ReadOnly,
+            },
             &mut warnings,
         )
         .unwrap();
@@ -2865,56 +4263,76 @@ mod tests {
         assert_eq!(repos[0].0.name, "hello-world");
         assert_eq!(repos[0].1, 100);
         assert_eq!(summary.total_prs, 0);
-        assert_eq!(warnings.messages, vec![contribution_partial_data_warning()]);
+        assert_eq!(warnings.messages.len(), 1);
+        assert!(warnings.messages[0].contains("100-repository limit"));
     }
 
     #[test]
-    fn current_schema_saturated_contribution_cache_hit_replays_partial_data_warning() {
+    fn malformed_v4_contribution_envelope_is_warning_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let from = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap();
-        let key = contribution_cache_key("node-octocat", "octocat", &from, &to, false, false);
-        let mut legacy_payload = serde_json::to_value(&CachedContributionWindow {
-            repos: vec![(sample_repo(), 1); 100],
-            summary: ContributionSummary::default(),
-            saturated: false,
-        })
-        .unwrap();
-        legacy_payload.as_object_mut().unwrap().remove("saturated");
-        std::fs::write(
-            tmp.path().join(format!("{key}.json")),
-            serde_json::to_string(&legacy_payload).unwrap(),
-        )
-        .unwrap();
-
-        let cached = cache
-            .get::<CachedContributionWindow>(&key)
-            .unwrap()
-            .unwrap();
-        assert!(!cached.saturated);
-
-        let client =
-            GithubClient::for_test("http://127.0.0.1:1", Vec::new(), Duration::from_secs(1));
-        let mut warnings = CacheWarnings::default();
-        let (repos, _) = get_contribution_repos_cached(
-            &client,
-            &cache,
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
+        let key = contribution_cache_key(
             "node-octocat",
             "octocat",
-            from,
-            to,
             false,
             false,
-            CachePolicy::ReadOnly,
-            to,
-            true,
-            &mut warnings,
+            false,
+            &window.scope,
+        );
+        std::fs::write(
+            tmp.path().join(format!("{key}.json")),
+            serde_json::to_string(&sample_for_test("legacy", 1)).unwrap(),
         )
         .unwrap();
+        let mut warnings = CacheWarnings::default();
 
-        assert_eq!(repos.len(), 1);
-        assert_eq!(warnings.messages, vec![contribution_partial_data_warning()]);
+        assert!(contribution_cache_get_or_warn(&cache, &key, &window, &mut warnings).is_none());
+        assert_eq!(warnings.messages.len(), 1);
+        assert!(warnings.messages[0].contains("GitHub cache read failed"));
+    }
+
+    #[test]
+    fn semantically_invalid_v4_contribution_envelope_is_warning_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = DiskCache::with_dir(tmp.path()).unwrap();
+        let window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
+        let key = contribution_cache_key(
+            "node-octocat",
+            "octocat",
+            false,
+            false,
+            false,
+            &window.scope,
+        );
+        cache
+            .set(
+                &key,
+                &CacheEnvelope {
+                    requested_from: fixed_time(8),
+                    checked_until: fixed_time(1),
+                    observed_at: fixed_time(8),
+                    completeness: Completeness::Complete,
+                    payload: sample_for_test("invalid", 1),
+                },
+            )
+            .unwrap();
+        let mut warnings = CacheWarnings::default();
+
+        assert!(contribution_cache_get_or_warn(&cache, &key, &window, &mut warnings).is_none());
+        assert_eq!(warnings.messages.len(), 1);
+        assert!(warnings.messages[0].contains("invalid; treating it as a cache miss"));
     }
 
     #[test]
@@ -2932,72 +4350,31 @@ mod tests {
     }
 
     #[test]
-    fn saturated_gap_activity_cannot_prove_repositories_inactive() {
-        let to_fetch = vec![
-            RepoHistoryRequest {
-                owner: "octocat".to_string(),
-                name: "hello-world".to_string(),
-                since: None,
-                until_exclusive: None,
-            },
-            RepoHistoryRequest {
-                owner: "octocat".to_string(),
-                name: "inactive".to_string(),
-                since: None,
-                until_exclusive: None,
-            },
-        ];
-        let gap_repo_keys = HashSet::from([
-            repo_key("octocat", "hello-world"),
-            repo_key("octocat", "inactive"),
-        ]);
-
-        assert_eq!(
-            inactive_gap_repos(&to_fetch, &gap_repo_keys, &vec![(sample_repo(), 1); 100]),
-            None
-        );
-    }
-
-    #[test]
-    fn complete_gap_activity_skips_repositories_without_activity() {
-        let to_fetch = vec![
-            RepoHistoryRequest {
-                owner: "octocat".to_string(),
-                name: "hello-world".to_string(),
-                since: None,
-                until_exclusive: None,
-            },
-            RepoHistoryRequest {
-                owner: "octocat".to_string(),
-                name: "inactive".to_string(),
-                since: None,
-                until_exclusive: None,
-            },
-        ];
-        let gap_repo_keys = HashSet::from([
-            repo_key("octocat", "hello-world"),
-            repo_key("octocat", "inactive"),
-        ]);
-
-        assert_eq!(
-            inactive_gap_repos(&to_fetch, &gap_repo_keys, &[(sample_repo(), 1)]),
-            Some(vec![("octocat".to_string(), "inactive".to_string())])
-        );
-    }
-
-    #[test]
     fn invalid_cached_history_commit_date_is_warning_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let key = "invalid-history-commit-date";
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
         cache
             .set(
                 key,
-                &CachedCommitHistory {
-                    since: "2025-01-01T00:00:00Z".to_string(),
-                    until: "2025-02-01T00:00:00Z".to_string(),
-                    checked_until: "2025-02-01T00:00:00Z".to_string(),
-                    commits: vec![CommitData {
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: vec![CommitData {
                         oid: Some("bad-date".to_string()),
                         additions: 1,
                         deletions: 0,
@@ -3008,7 +4385,7 @@ mod tests {
             .unwrap();
         let mut warnings = CacheWarnings::default();
 
-        let cached = history_cache_get_or_warn(&cache, key, &mut warnings);
+        let cached = history_cache_get_or_warn(&cache, key, &window, &mut warnings);
 
         assert!(cached.is_none());
         assert_eq!(warnings.messages.len(), 1);
@@ -3018,30 +4395,43 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cached_history_checked_boundary_is_warning_miss() {
+    fn invalid_cached_history_coverage_boundary_is_warning_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let key = "invalid-history-check-boundary";
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
         cache
             .set(
                 key,
-                &CachedCommitHistory {
-                    since: "2025-01-01T00:00:00Z".to_string(),
-                    until: "2025-02-01T00:00:00Z".to_string(),
-                    checked_until: "not-a-timestamp".to_string(),
-                    commits: vec![],
+                &CacheEnvelope::<Vec<CommitData>> {
+                    requested_from: to,
+                    checked_until: from,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: vec![],
                 },
             )
             .unwrap();
         let mut warnings = CacheWarnings::default();
 
-        let cached = history_cache_get_or_warn(&cache, key, &mut warnings);
+        let cached = history_cache_get_or_warn(&cache, key, &window, &mut warnings);
 
         assert!(cached.is_none());
         assert_eq!(warnings.messages.len(), 1);
         assert!(warnings.messages[0].contains("history cache"));
         assert!(warnings.messages[0].contains(key));
-        assert!(warnings.messages[0].contains("check end"));
+        assert!(warnings.messages[0].contains("checked end"));
     }
 
     #[test]
@@ -3049,14 +4439,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let key = "valid-history";
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let window = QueryWindow {
+            scope: CacheWindowScope::Fixed {
+                from,
+                until_exclusive: to,
+            },
+            requested_from: from,
+            until_exclusive: to,
+            observed_at: to,
+            completed: true,
+        };
         cache
             .set(
                 key,
-                &CachedCommitHistory {
-                    since: "2025-01-01T00:00:00Z".to_string(),
-                    until: "2025-02-01T00:00:00Z".to_string(),
-                    checked_until: "2025-02-01T00:00:00Z".to_string(),
-                    commits: vec![CommitData {
+                &CacheEnvelope {
+                    requested_from: from,
+                    checked_until: to,
+                    observed_at: to,
+                    completeness: Completeness::Complete,
+                    payload: vec![CommitData {
                         oid: Some("valid".to_string()),
                         additions: 1,
                         deletions: 0,
@@ -3067,9 +4470,9 @@ mod tests {
             .unwrap();
         let mut warnings = CacheWarnings::default();
 
-        let cached = history_cache_get_or_warn(&cache, key, &mut warnings);
+        let cached = history_cache_get_or_warn(&cache, key, &window, &mut warnings);
 
-        assert_eq!(cached.unwrap().commits.len(), 1);
+        assert_eq!(cached.unwrap().payload.len(), 1);
         assert!(warnings.messages.is_empty());
     }
 
@@ -3078,14 +4481,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         std::fs::create_dir(tmp.path().join("blocked.json")).unwrap();
-        let fresh = CachedContributionWindow {
+        let fresh = CachedContributionPayload {
             repos: vec![(sample_repo(), 13)],
             summary: ContributionSummary {
                 total_prs: 2,
                 total_reviews: 3,
                 total_issues: 5,
             },
-            saturated: false,
         };
         let mut warnings = CacheWarnings::default();
 
@@ -3125,23 +4527,20 @@ mod tests {
     fn history_cache_same_repo_two_users_never_share_commits() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
-        let since = "2025-01-01T00:00:00Z";
-        let until = "2025-02-01T00:00:00Z";
-        let alice_key = history_cache_key(
-            "node-alice",
-            "octo",
-            "repo",
-            Some(since),
-            Some(until),
-            false,
-        );
-        let bob_key =
-            history_cache_key("node-bob", "octo", "repo", Some(since), Some(until), false);
-        let history = |additions| CachedCommitHistory {
-            since: since.to_string(),
-            until: until.to_string(),
-            checked_until: until.to_string(),
-            commits: vec![CommitData {
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let until = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let scope = CacheWindowScope::Fixed {
+            from,
+            until_exclusive: until,
+        };
+        let alice_key = history_cache_key("node-alice", "octo", "repo", false, &scope);
+        let bob_key = history_cache_key("node-bob", "octo", "repo", false, &scope);
+        let history = |additions| CacheEnvelope {
+            requested_from: from,
+            checked_until: until,
+            observed_at: until,
+            completeness: Completeness::Complete,
+            payload: vec![CommitData {
                 oid: None,
                 additions,
                 deletions: 0,
@@ -3153,13 +4552,16 @@ mod tests {
         cache.set(&bob_key, &history(22)).unwrap();
 
         let alice = cache
-            .get::<CachedCommitHistory>(&alice_key)
+            .get::<CacheEnvelope<Vec<CommitData>>>(&alice_key)
             .unwrap()
             .unwrap();
-        let bob = cache.get::<CachedCommitHistory>(&bob_key).unwrap().unwrap();
+        let bob = cache
+            .get::<CacheEnvelope<Vec<CommitData>>>(&bob_key)
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(alice.commits[0].additions, 11);
-        assert_eq!(bob.commits[0].additions, 22);
+        assert_eq!(alice.payload[0].additions, 11);
+        assert_eq!(bob.payload[0].additions, 22);
     }
 
     fn sample_json() -> &'static str {
@@ -3908,7 +5310,13 @@ mod tests {
         DropConnection,
         Json {
             status: u16,
-            body: &'static str,
+            body: String,
+            headers: Vec<(String, String)>,
+            delay: Duration,
+        },
+        OwnedJson {
+            status: u16,
+            body: String,
             delay: Duration,
         },
     }
@@ -3939,6 +5347,27 @@ mod tests {
                         recorded_requests.lock().unwrap().push(String::new());
                     }
                     StubResponse::Json {
+                        status,
+                        body,
+                        headers,
+                        delay,
+                    } => {
+                        recorded_requests
+                            .lock()
+                            .unwrap()
+                            .push(read_stub_request(&mut stream));
+                        thread::sleep(delay);
+                        let headers = headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
+                        let response = format!(
+                            "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    StubResponse::OwnedJson {
                         status,
                         body,
                         delay,
@@ -4024,9 +5453,142 @@ mod tests {
     fn graphql_success_response() -> StubResponse {
         StubResponse::Json {
             status: 200,
-            body: r#"{"data":{"ok":true}}"#,
+            body: r#"{"data":{"ok":true}}"#.to_string(),
+            headers: Vec::new(),
             delay: Duration::ZERO,
         }
+    }
+
+    fn json_response(status: u16, body: impl Into<String>) -> StubResponse {
+        StubResponse::Json {
+            status,
+            body: body.into(),
+            headers: Vec::new(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn json_response_with_headers(
+        status: u16,
+        body: impl Into<String>,
+        headers: &[(&str, &str)],
+    ) -> StubResponse {
+        StubResponse::Json {
+            status,
+            body: body.into(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn permission_403_fails_once_while_exhausted_403_uses_reset() {
+        let server = start_stub(vec![json_response(403, "{}")]);
+        let client = GithubClient::for_test(
+            &server.base_url,
+            vec![Duration::ZERO],
+            Duration::from_secs(1),
+        );
+
+        let error = client
+            .resolve_single_email_result("octocat", "repo", "octocat@example.com")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("permission"));
+        assert_eq!(server.finish().len(), 1);
+
+        let now = fixed_time(1);
+        assert_eq!(
+            retry_decision(
+                reqwest::StatusCode::FORBIDDEN,
+                &response_headers(&[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", &(now.timestamp() + 5).to_string()),
+                ]),
+                Duration::ZERO,
+                now,
+                Duration::from_secs(120),
+            ),
+            RetryDecision::RetryAfter(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn identity_report_truncates_and_canonicalizes_known_emails() {
+        let commits = (0..20)
+            .map(|index| {
+                let email = match index {
+                    0 => " Alice@Example.COM ",
+                    1 => "alice@example.com",
+                    2 => " BOB@Example.com",
+                    _ => "bob@example.com ",
+                };
+                json!({ "commit": { "author": { "email": email } } })
+            })
+            .collect::<Vec<_>>();
+        let server = start_stub(vec![
+            json_response(
+                200,
+                r#"{"data":{"user":{"repositories":{"pageInfo":{"hasNextPage":true,"endCursor":"cursor"},"nodes":[{"name":"repo-one","owner":{"login":"octocat"},"isFork":false,"languages":{"edges":[]}}]}}}}"#,
+            ),
+            json_response_with_headers(
+                200,
+                serde_json::to_string(&commits).unwrap(),
+                &[("Link", "<https://example.test/next>; rel=\"next\"")],
+            ),
+        ]);
+        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
+
+        let report = client.resolve_user_identity("octocat");
+
+        assert_eq!(
+            report.emails,
+            BTreeSet::from([
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+            ])
+        );
+        assert_eq!(report.repositories_examined, 1);
+        assert_eq!(report.logical_requests, 2);
+        assert!(report.truncated_repositories);
+        assert!(report.truncated_commits);
+        assert!(report.failures.is_empty());
+        assert!(report.is_partial());
+        let warning = report.warning().unwrap();
+        assert!(warning.contains("known emails"));
+        assert!(warning.contains("may miss others"));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn identity_report_permission_403_records_failure_without_retry() {
+        let server = start_stub(vec![
+            json_response(
+                200,
+                r#"{"data":{"user":{"repositories":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"name":"repo-one","owner":{"login":"octocat"},"isFork":false,"languages":{"edges":[]}}]}}}}"#,
+            ),
+            json_response(403, "{}"),
+        ]);
+        let client = GithubClient::for_test(
+            &server.base_url,
+            vec![Duration::ZERO],
+            Duration::from_secs(1),
+        );
+
+        let report = client.resolve_user_identity("octocat");
+
+        assert!(report.is_partial());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].repository.as_deref(),
+            Some("octocat/repo-one")
+        );
+        assert_eq!(report.logical_requests, 2);
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]
@@ -4034,17 +5596,20 @@ mod tests {
         let server = start_stub(vec![
             StubResponse::Json {
                 status: 408,
-                body: "{}",
+                body: "{}".to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             StubResponse::Json {
                 status: 429,
-                body: "{}",
+                body: "{}".to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             StubResponse::Json {
                 status: 503,
-                body: "{}",
+                body: "{}".to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             graphql_success_response(),
@@ -4067,7 +5632,8 @@ mod tests {
             (0..7)
                 .map(|_| StubResponse::Json {
                     status: 503,
-                    body: "{}",
+                    body: "{}".to_string(),
+                    headers: Vec::new(),
                     delay: Duration::ZERO,
                 })
                 .collect(),
@@ -4111,7 +5677,8 @@ mod tests {
             (0..3)
                 .map(|_| StubResponse::Json {
                     status: 200,
-                    body: r#"{"data":{"ok":true}}"#,
+                    body: r#"{"data":{"ok":true}}"#.to_string(),
+                    headers: Vec::new(),
                     delay: Duration::from_millis(100),
                 })
                 .collect(),
@@ -4139,12 +5706,14 @@ mod tests {
         let server = start_stub(vec![
             StubResponse::Json {
                 status: 503,
-                body: "{}",
+                body: "{}".to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
             StubResponse::Json {
                 status: 200,
-                body: r#"[{"author":{"login":"alice"}}]"#,
+                body: r#"[{"author":{"login":"alice"}}]"#.to_string(),
+                headers: Vec::new(),
                 delay: Duration::ZERO,
             },
         ]);
@@ -4168,7 +5737,8 @@ mod tests {
             (0..3)
                 .map(|_| StubResponse::Json {
                     status: 503,
-                    body: "{}",
+                    body: "{}".to_string(),
+                    headers: Vec::new(),
                     delay: Duration::ZERO,
                 })
                 .collect(),
@@ -4190,11 +5760,7 @@ mod tests {
 
     #[test]
     fn rest_author_query_is_url_encoded() {
-        let server = start_stub(vec![StubResponse::Json {
-            status: 200,
-            body: "[]",
-            delay: Duration::ZERO,
-        }]);
+        let server = start_stub(vec![json_response(200, "[]")]);
         let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
         let email = "a+b @example.com";
 

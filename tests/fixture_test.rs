@@ -130,6 +130,41 @@ fn append_commit_with_committer(repo: &git2::Repository, committer_name: &str) {
     .expect("commit filtered fixture change");
 }
 
+#[cfg(feature = "github")]
+fn append_noreply_commit(repo: &git2::Repository) {
+    let parent = repo
+        .head()
+        .expect("fixture HEAD")
+        .peel_to_commit()
+        .expect("fixture HEAD commit");
+    let parent_tree = parent.tree().expect("fixture parent tree");
+    let blob = repo.blob(b"noreply commit\n").expect("noreply blob");
+    let mut tree_builder = repo
+        .treebuilder(Some(&parent_tree))
+        .expect("noreply tree builder");
+    tree_builder
+        .insert("noreply.txt", blob, 0o100644)
+        .expect("insert noreply file");
+    let tree = repo
+        .find_tree(tree_builder.write().expect("write noreply tree"))
+        .expect("find noreply tree");
+    let signature = git2::Signature::new(
+        "Octocat",
+        "583231+octocat@users.noreply.github.com",
+        &git2::Time::new(1_710_000_000, 0),
+    )
+    .expect("noreply signature");
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "Add noreply commit",
+        &tree,
+        &[&parent],
+    )
+    .expect("commit noreply fixture change");
+}
+
 #[test]
 fn test_fixture_creates_five_commits() {
     let tmp = TempDir::new().unwrap();
@@ -244,6 +279,41 @@ fn cli_committer_matches_name_and_email() {
 
         assert_eq!(json["totals"]["total_commits"], 1, "pattern: {pattern}");
     }
+}
+
+#[cfg(feature = "github")]
+#[test]
+fn cli_me_github_noreply_matches_without_token_or_network() {
+    let tmp = TempDir::new().unwrap();
+    let repo = common::create_test_repo(tmp.path());
+    append_noreply_commit(&repo);
+
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args([
+            "stats",
+            tmp.path().to_str().expect("UTF-8 temporary path"),
+            "--me",
+            "github:octocat",
+            "--format",
+            "json",
+        ])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run logit stats");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("stats JSON output");
+    assert_eq!(json["totals"]["total_commits"], 1);
+    assert_eq!(
+        stderr
+            .matches("Warning: GitHub identity resolution")
+            .count(),
+        1,
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
 }
 
 #[test]
