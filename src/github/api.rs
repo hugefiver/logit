@@ -9,6 +9,56 @@ use super::cache::DiskCache;
 use crate::cli::{GroupBy, Period};
 use crate::stats::models::{GroupNode, PeriodStats};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CachePolicy {
+    ReadOnly,
+    Refresh,
+    Disabled,
+}
+
+impl CachePolicy {
+    pub fn from_flags(no_cache: bool, refresh_cache: bool) -> (Self, bool) {
+        if no_cache {
+            (Self::Disabled, refresh_cache)
+        } else if refresh_cache {
+            (Self::Refresh, false)
+        } else {
+            (Self::ReadOnly, false)
+        }
+    }
+
+    pub fn can_read(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::Refresh)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheWindowScope {
+    Fixed {
+        from: DateTime<Utc>,
+        until_exclusive: DateTime<Utc>,
+    },
+    Rolling {
+        lookback_nanoseconds: i64,
+    },
+    Anchored {
+        from: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryWindow {
+    pub scope: CacheWindowScope,
+    pub requested_from: DateTime<Utc>,
+    pub until_exclusive: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub completed: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GithubUser {
     pub login: String,
@@ -395,13 +445,12 @@ impl GithubClient {
     pub fn get_contribution_repos(
         &self,
         username: &str,
-        since: Option<i64>,
-        until: Option<i64>,
+        from: DateTime<Utc>,
+        until_exclusive: DateTime<Utc>,
         include_forks: bool,
         include_contributed: bool,
     ) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
-        let now = effective_window_end(until);
-        let windows = contribution_windows(since, now);
+        let windows = contribution_windows(from, until_exclusive);
         let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
         let mut total_summary = ContributionSummary::default();
         let mut has_saturated_window = false;
@@ -1331,27 +1380,22 @@ fn build_batch_history_variables(user_node_id: &str, active: &[PageRequest]) -> 
 }
 
 fn contribution_windows(
-    since: Option<i64>,
-    now: DateTime<Utc>,
+    from: DateTime<Utc>,
+    until_exclusive: DateTime<Utc>,
 ) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
-    let one_year_ago = now - Duration::days(365);
-    let start = since
-        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
-        .unwrap_or(one_year_ago);
-
-    if start >= now {
-        return vec![(now - Duration::minutes(1), now)];
+    if from >= until_exclusive {
+        return Vec::new();
     }
 
     let mut windows = Vec::new();
-    let mut window_start = start;
+    let mut window_start = from;
 
-    while window_start < now {
+    while window_start < until_exclusive {
         let candidate_end = window_start + Duration::days(365);
-        let window_end = if candidate_end < now {
+        let window_end = if candidate_end < until_exclusive {
             candidate_end
         } else {
-            now
+            until_exclusive
         };
         windows.push((window_start, window_end));
         window_start = window_end;
@@ -1402,6 +1446,7 @@ fn emit_cache_warnings(warnings: &mut CacheWarnings) {
     }
 }
 
+#[cfg(test)]
 fn cache_init_or_warn(
     cache: anyhow::Result<DiskCache>,
     warnings: &mut CacheWarnings,
@@ -1413,6 +1458,28 @@ fn cache_init_or_warn(
             None
         }
     }
+}
+
+pub fn initialize_cache_for_policy<F, E>(policy: CachePolicy, factory: F) -> Option<DiskCache>
+where
+    F: FnOnce() -> Result<DiskCache, E>,
+{
+    if matches!(policy, CachePolicy::Disabled) {
+        None
+    } else {
+        factory().ok()
+    }
+}
+
+fn initialize_cache_for_policy_or_warn(
+    policy: CachePolicy,
+    warnings: &mut CacheWarnings,
+) -> Option<DiskCache> {
+    initialize_cache_for_policy(policy, || {
+        DiskCache::new().map_err(|error| {
+            warnings.push(format!("GitHub cache initialization failed: {error}"));
+        })
+    })
 }
 
 fn cache_get_or_warn<T: serde::de::DeserializeOwned>(
@@ -1701,17 +1768,16 @@ fn get_contribution_repos_cached(
     cache: &DiskCache,
     user_node_id: &str,
     username: &str,
-    since: Option<i64>,
-    until: Option<i64>,
+    from: DateTime<Utc>,
+    until_exclusive: DateTime<Utc>,
     include_forks: bool,
     include_contributed: bool,
-    read_cache: bool,
-    write_cache: bool,
+    cache_policy: CachePolicy,
+    observed_at: DateTime<Utc>,
+    query_completed: bool,
     warnings: &mut CacheWarnings,
 ) -> anyhow::Result<(Vec<(RepoWithLangs, u64)>, ContributionSummary)> {
-    let now = effective_window_end(until);
-    let today = Utc::now().date_naive();
-    let windows = contribution_windows(since, now);
+    let windows = contribution_windows(from, until_exclusive);
     let mut merged: HashMap<String, (RepoWithLangs, u64)> = HashMap::new();
     let mut accumulated_summary = ContributionSummary::default();
 
@@ -1725,10 +1791,10 @@ fn get_contribution_repos_cached(
             include_contributed,
         );
 
-        let window_completed = to.date_naive() < today;
+        let window_completed = query_completed || to < observed_at;
 
         let cached: Option<CachedContributionWindow> =
-            if read_cache && (window_completed || !write_cache) {
+            if cache_policy.can_read() && (window_completed || !cache_policy.can_write()) {
                 cache_get_or_warn(cache, &key, warnings)
             } else {
                 None
@@ -1746,7 +1812,7 @@ fn get_contribution_repos_cached(
             let data = client.graphql_query(CONTRIBUTIONS_QUERY, &variables)?;
             let (repos, summary) = parse_contributions_collection_data(data, username)?;
             let saturated = contribution_window_is_saturated(&repos);
-            if write_cache {
+            if cache_policy.can_write() {
                 cache_set_or_warn(
                     cache,
                     &key,
@@ -1809,18 +1875,13 @@ pub fn fetch_user_stats(
     include_forks: bool,
     include_contributed: bool,
     include_private: bool,
-    since: Option<i64>,
-    until: Option<i64>,
-    read_cache: bool,
-    write_cache: bool,
+    query_window: &QueryWindow,
+    cache_policy: CachePolicy,
 ) -> anyhow::Result<(Vec<RepoContribution>, ContributionSummary)> {
     let mut cache_warnings = CacheWarnings::default();
-    let cache = if read_cache || write_cache {
-        cache_init_or_warn(DiskCache::new(), &mut cache_warnings)
-    } else {
-        None
-    };
-    let now = effective_window_end(until);
+    let cache = initialize_cache_for_policy_or_warn(cache_policy, &mut cache_warnings);
+    let now = query_window.until_exclusive.min(query_window.observed_at);
+    let from = query_window.requested_from;
 
     let (mut repo_rows, contribution_summary) = if let Some(cache) = cache.as_ref() {
         get_contribution_repos_cached(
@@ -1828,16 +1889,17 @@ pub fn fetch_user_stats(
             cache,
             user_node_id,
             username,
-            since,
-            until,
+            from,
+            now,
             include_forks,
             include_contributed,
-            read_cache,
-            write_cache,
+            cache_policy,
+            query_window.observed_at,
+            query_window.completed,
             &mut cache_warnings,
         )?
     } else {
-        client.get_contribution_repos(username, since, until, include_forks, include_contributed)?
+        client.get_contribution_repos(username, from, now, include_forks, include_contributed)?
     };
 
     if include_private {
@@ -1878,12 +1940,7 @@ pub fn fetch_user_stats(
     eprintln!("Found {} repos with contributions", repo_rows.len());
 
     let until_iso = Some(now.to_rfc3339());
-    let default_since_ts = (now - Duration::days(365)).timestamp();
-    let effective_since_ts = since.unwrap_or(default_since_ts);
-    let since_iso = Utc
-        .timestamp_opt(effective_since_ts, 0)
-        .single()
-        .map(|dt| dt.to_rfc3339());
+    let since_iso = Some(from.to_rfc3339());
 
     let mut commit_history_by_repo: HashMap<String, Vec<CommitData>> = HashMap::new();
     let mut to_fetch: Vec<RepoHistoryRequest> = Vec::new();
@@ -1900,7 +1957,7 @@ pub fn fetch_user_stats(
         );
         let repo_name = format!("{}/{}", repo.owner, repo.name);
 
-        let cached: Option<CachedCommitHistory> = if read_cache {
+        let cached: Option<CachedCommitHistory> = if cache_policy.can_read() {
             cache
                 .as_ref()
                 .and_then(|c| history_cache_get_or_warn(c, &history_key, &mut cache_warnings))
@@ -1909,7 +1966,7 @@ pub fn fetch_user_stats(
         };
 
         match &cached {
-            Some(ch) if write_cache => {
+            Some(ch) if cache_policy.can_write() => {
                 let overlap = filter_commits_to_range(
                     &ch.commits,
                     since_iso.as_deref(),
@@ -1949,7 +2006,7 @@ pub fn fetch_user_stats(
                 )?;
                 commit_history_by_repo.insert(repo_name, in_range);
             }
-            None if write_cache => {
+            None if cache_policy.can_write() => {
                 to_fetch.push(RepoHistoryRequest {
                     owner: repo.owner.clone(),
                     name: repo.name.clone(),
@@ -1992,7 +2049,9 @@ pub fn fetch_user_stats(
                     !inactive_keys.contains(&repo_key(&request.owner, &request.name))
                 });
 
-                if write_cache && let Some(c) = &cache {
+                if cache_policy.can_write()
+                    && let Some(c) = &cache
+                {
                     for (owner, name) in &inactive {
                         let history_key = history_cache_key(
                             user_node_id,
@@ -2048,7 +2107,7 @@ pub fn fetch_user_stats(
                     new_commits
                 };
 
-                if write_cache
+                if cache_policy.can_write()
                     && history_cache_write_allowed(request, &fetched.capped_repos)
                     && let Some(c) = &cache
                 {
@@ -2434,14 +2493,6 @@ pub fn contributions_to_repo_stats(
     result
 }
 
-fn effective_window_end(until: Option<i64>) -> DateTime<Utc> {
-    let now = Utc::now();
-    until
-        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
-        .map(|dt| dt.min(now))
-        .unwrap_or(now)
-}
-
 fn extract_noreply_username(email: &str) -> Option<String> {
     if !email.ends_with("noreply.github.com") {
         return None;
@@ -2482,6 +2533,7 @@ pub struct ContributorWeek {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::Cell;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -2545,6 +2597,19 @@ mod tests {
         assert_ne!(contribution, contribution_component);
         assert_ne!(contribution, contribution_range);
         assert_ne!(contribution, contribution_mode);
+    }
+
+    #[test]
+    fn disabled_cache_policy_never_invokes_cache_factory() {
+        let invocations = Cell::new(0);
+
+        let cache = initialize_cache_for_policy(CachePolicy::Disabled, || {
+            invocations.set(invocations.get() + 1);
+            DiskCache::new()
+        });
+
+        assert!(cache.is_none());
+        assert_eq!(invocations.get(), 0);
     }
 
     #[test]
@@ -2675,12 +2740,13 @@ mod tests {
             &cache,
             "node-octocat",
             "octocat",
-            Some(from.timestamp()),
-            Some(to.timestamp()),
+            from,
+            to,
             false,
             false,
+            CachePolicy::ReadOnly,
+            to,
             true,
-            false,
             &mut warnings,
         )
         .unwrap();
@@ -2697,7 +2763,7 @@ mod tests {
     fn contribution_queries_make_adjacent_half_open_windows_non_overlapping() {
         let from = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
         let until = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-        let windows = contribution_windows(Some(from.timestamp()), until);
+        let windows = contribution_windows(from, until);
         let contribution_response = r#"{"data":{"user":{"contributionsCollection":{"totalPullRequestContributions":0,"totalPullRequestReviewContributions":0,"totalIssueContributions":0,"commitContributionsByRepository":[]}}}}"#;
         let server = start_stub(vec![
             StubResponse::Json {
@@ -2719,13 +2785,7 @@ mod tests {
         let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
 
         client
-            .get_contribution_repos(
-                "octocat",
-                Some(from.timestamp()),
-                Some(until.timestamp()),
-                false,
-                false,
-            )
+            .get_contribution_repos("octocat", from, until, false, false)
             .unwrap();
 
         let requests = server.finish();
@@ -2790,12 +2850,13 @@ mod tests {
             &cache,
             "node-octocat",
             "octocat",
-            Some(from.timestamp()),
-            Some(to.timestamp()),
+            from,
+            to,
             false,
             false,
+            CachePolicy::ReadOnly,
+            to,
             true,
-            false,
             &mut warnings,
         )
         .unwrap();
@@ -2841,12 +2902,13 @@ mod tests {
             &cache,
             "node-octocat",
             "octocat",
-            Some(from.timestamp()),
-            Some(to.timestamp()),
+            from,
+            to,
             false,
             false,
+            CachePolicy::ReadOnly,
+            to,
             true,
-            false,
             &mut warnings,
         )
         .unwrap();

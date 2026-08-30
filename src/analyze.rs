@@ -36,11 +36,11 @@ pub fn normalize_repo_inputs(
         .collect();
 
     repos.sort_by(|left, right| {
-        repo_identity_key(&left.id)
-            .cmp(&repo_identity_key(&right.id))
+        platform_repo_key(&left.id, cfg!(windows))
+            .cmp(&platform_repo_key(&right.id, cfg!(windows)))
             .then_with(|| left.id.cmp(&right.id))
     });
-    repos.dedup_by(|left, right| repo_ids_equal(&left.id, &right.id));
+    repos.dedup_by(|left, right| platform_repo_eq(&left.id, &right.id, cfg!(windows)));
     assign_repo_labels(&mut repos);
 
     let Some(selectors) = selectors else {
@@ -49,22 +49,25 @@ pub fn normalize_repo_inputs(
 
     let mut selected_ids = HashSet::new();
     for selector in selectors {
-        let normalized_selector = selector.replace('\\', "/");
+        let normalized_selector = platform_repo_key(selector, cfg!(windows));
         if let Some(repo) = repos.iter().find(|repo| {
-            repo.label == normalized_selector || repo_ids_equal(&repo.id, &normalized_selector)
+            platform_repo_eq(&repo.label, &normalized_selector, cfg!(windows))
+                || platform_repo_eq(&repo.id, &normalized_selector, cfg!(windows))
         }) {
-            selected_ids.insert(repo_identity_key(&repo.id));
+            selected_ids.insert(platform_repo_key(&repo.id, cfg!(windows)));
             continue;
         }
 
         if !normalized_selector.contains('/') {
             let matches: Vec<&RepoInput> = repos
                 .iter()
-                .filter(|repo| repo_basename(&repo.id) == normalized_selector)
+                .filter(|repo| {
+                    platform_repo_eq(repo_basename(&repo.id), &normalized_selector, cfg!(windows))
+                })
                 .collect();
             match matches.as_slice() {
                 [repo] => {
-                    selected_ids.insert(repo_identity_key(&repo.id));
+                    selected_ids.insert(platform_repo_key(&repo.id, cfg!(windows)));
                     continue;
                 }
                 [] => {}
@@ -91,7 +94,7 @@ pub fn normalize_repo_inputs(
 
     Ok(repos
         .into_iter()
-        .filter(|repo| selected_ids.contains(&repo_identity_key(&repo.id)))
+        .filter(|repo| selected_ids.contains(&platform_repo_key(&repo.id, cfg!(windows))))
         .collect())
 }
 
@@ -122,16 +125,19 @@ fn repo_id_for_path(path: &Path) -> String {
     if id.is_empty() { ".".to_string() } else { id }
 }
 
-fn repo_identity_key(id: &str) -> String {
-    if cfg!(windows) {
-        id.to_lowercase()
+/// Normalize a repository identity for a local platform match.
+pub fn platform_repo_key(value: &str, windows: bool) -> String {
+    let normalized = value.replace('\\', "/");
+    if windows {
+        normalized.to_ascii_lowercase()
     } else {
-        id.to_string()
+        normalized
     }
 }
 
-fn repo_ids_equal(left: &str, right: &str) -> bool {
-    repo_identity_key(left) == repo_identity_key(right)
+/// Compare repository identities using a local platform's path semantics.
+pub fn platform_repo_eq(left: &str, right: &str, windows: bool) -> bool {
+    platform_repo_key(left, windows) == platform_repo_key(right, windows)
 }
 
 fn repo_basename(id: &str) -> &str {
@@ -157,7 +163,7 @@ fn assign_repo_labels(repos: &mut [RepoInput]) {
         let basename = repo_basename(&repos[index].id);
         let matching_basenames = repos
             .iter()
-            .filter(|repo| repo_basename(&repo.id) == basename)
+            .filter(|repo| platform_repo_eq(repo_basename(&repo.id), basename, cfg!(windows)))
             .count();
 
         if matching_basenames == 1 {
@@ -170,8 +176,8 @@ fn assign_repo_labels(repos: &mut [RepoInput]) {
             let label = suffix_label(&repos[index].id, depth);
             let collides = repos.iter().enumerate().any(|(other_index, repo)| {
                 other_index != index
-                    && repo_basename(&repo.id) == basename
-                    && suffix_label(&repo.id, depth) == label
+                    && platform_repo_eq(repo_basename(&repo.id), basename, cfg!(windows))
+                    && platform_repo_eq(&suffix_label(&repo.id, depth), &label, cfg!(windows))
             });
             if !collides {
                 repos[index].label = label;
@@ -251,7 +257,7 @@ fn analyze_single_repo(
 
         apply_language_to_changes(&mut file_changes);
 
-        let co_authors = extract_co_authors(&ci.message);
+        let co_authors = extract_co_authors(&ci.message, &ci.author);
         let message_subject = ci.message.lines().next().unwrap_or("").to_string();
 
         stats.push(CommitStats {
@@ -451,6 +457,14 @@ mod tests {
         assert!(repos.iter().all(|repo| repo.id.contains('/')));
         assert_eq!(repos[0].label, "left/service");
         assert_eq!(repos[1].label, "right/service");
+    }
+
+    #[test]
+    fn platform_repo_keys_and_equality_follow_the_requested_platform_mode() {
+        assert_eq!(platform_repo_key(r"Team\Service", true), "team/service");
+        assert_eq!(platform_repo_key(r"Team\Service", false), "Team/Service");
+        assert!(platform_repo_eq("Team/Service", "team/service", true));
+        assert!(!platform_repo_eq("Team/Service", "team/service", false));
     }
 
     #[test]

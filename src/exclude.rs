@@ -6,8 +6,30 @@
 use glob::Pattern;
 use regex::Regex;
 
+use crate::analyze::platform_repo_key;
 use crate::stats::models::Author;
 use crate::stats::models::CommitStats;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoMatchMode {
+    LocalPlatform { windows: bool },
+    Github,
+}
+
+impl RepoMatchMode {
+    fn repo_key(self, value: &str) -> String {
+        match self {
+            Self::LocalPlatform { windows } => platform_repo_key(value, windows),
+            Self::Github => platform_repo_key(value, true),
+        }
+    }
+}
+
+fn local_repo_match_mode() -> RepoMatchMode {
+    RepoMatchMode::LocalPlatform {
+        windows: cfg!(windows),
+    }
+}
 
 #[derive(Debug, Clone)]
 enum AuthorPattern {
@@ -165,15 +187,21 @@ impl ExcludeRule {
         Ok(rules)
     }
 
-    fn matches_repo(&self, repo_name: &str) -> bool {
+    pub fn matches_repo_with_mode(&self, repo_name: &str, mode: RepoMatchMode) -> bool {
         match &self.repo {
             Some(r) => {
-                repo_name == r.as_str()
-                    || repo_name.starts_with(&format!("{}/", r))
-                    || repo_name.ends_with(&format!("/{}", r))
+                let repo_name = mode.repo_key(repo_name);
+                let rule_name = mode.repo_key(r);
+                repo_name == rule_name
+                    || repo_name.starts_with(&format!("{rule_name}/"))
+                    || repo_name.ends_with(&format!("/{rule_name}"))
             }
             None => true,
         }
+    }
+
+    fn matches_repo(&self, repo_name: &str) -> bool {
+        self.matches_repo_with_mode(repo_name, local_repo_match_mode())
     }
 
     pub fn is_repo_exclusion(&self) -> bool {
@@ -191,14 +219,23 @@ impl ExcludeRule {
             .any(|g| g.path_pattern.is_some() || g.path_regex.is_some())
     }
 
-    pub fn all_langs_for_repo(&self, repo_name: &str) -> Vec<String> {
-        if !self.matches_repo(repo_name) {
+    pub fn all_langs_for_repo_with_mode(
+        &self,
+        repo_name: &str,
+        mode: RepoMatchMode,
+    ) -> Vec<String> {
+        if !self.matches_repo_with_mode(repo_name, mode) {
             return Vec::new();
         }
         self.and_groups
             .iter()
             .filter_map(|g| g.lang.clone())
             .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn all_langs_for_repo(&self, repo_name: &str) -> Vec<String> {
+        self.all_langs_for_repo_with_mode(repo_name, local_repo_match_mode())
     }
 
     pub fn collect_github_users(&self) -> Vec<String> {
@@ -405,16 +442,34 @@ pub fn filter_commits(commits: Vec<CommitStats>, rules: &[ExcludeRule]) -> Vec<C
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn is_repo_excluded(repo_name: &str, rules: &[ExcludeRule]) -> bool {
-    rules
-        .iter()
-        .any(|r| r.matches_repo(repo_name) && r.is_repo_exclusion())
+    is_repo_excluded_with_mode(repo_name, rules, local_repo_match_mode())
 }
 
-pub fn excluded_langs_for_repo(repo_name: &str, rules: &[ExcludeRule]) -> Vec<String> {
+pub fn is_repo_excluded_with_mode(
+    repo_name: &str,
+    rules: &[ExcludeRule],
+    mode: RepoMatchMode,
+) -> bool {
     rules
         .iter()
-        .flat_map(|r| r.all_langs_for_repo(repo_name))
+        .any(|r| r.matches_repo_with_mode(repo_name, mode) && r.is_repo_exclusion())
+}
+
+#[allow(dead_code)]
+pub fn excluded_langs_for_repo(repo_name: &str, rules: &[ExcludeRule]) -> Vec<String> {
+    excluded_langs_for_repo_with_mode(repo_name, rules, local_repo_match_mode())
+}
+
+pub fn excluded_langs_for_repo_with_mode(
+    repo_name: &str,
+    rules: &[ExcludeRule],
+    mode: RepoMatchMode,
+) -> Vec<String> {
+    rules
+        .iter()
+        .flat_map(|r| r.all_langs_for_repo_with_mode(repo_name, mode))
         .collect()
 }
 
@@ -555,6 +610,49 @@ mod tests {
         };
         assert!(rule.matches_repo("owner/repo-name"));
         assert!(!rule.matches_repo("other/repo"));
+    }
+
+    #[test]
+    fn explicit_repo_match_modes_apply_platform_and_github_rules() {
+        let exact = ExcludeRule {
+            repo: Some("Team/Service".into()),
+            and_groups: vec![],
+        };
+        assert!(exact.matches_repo_with_mode(
+            "team/service",
+            RepoMatchMode::LocalPlatform { windows: true }
+        ));
+        assert!(!exact.matches_repo_with_mode(
+            "team/service",
+            RepoMatchMode::LocalPlatform { windows: false }
+        ));
+        assert!(exact.matches_repo_with_mode("team/service", RepoMatchMode::Github));
+
+        let component = ExcludeRule {
+            repo: Some("Team".into()),
+            and_groups: vec![],
+        };
+        assert!(component.matches_repo_with_mode(
+            "team/service",
+            RepoMatchMode::LocalPlatform { windows: true }
+        ));
+        assert!(component.matches_repo_with_mode("owner/team", RepoMatchMode::Github));
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn github_repository_language_and_repo_excludes_are_case_insensitive_on_every_host() {
+        let rules = ExcludeRule::parse_many("Acme/Widget:lang:Rust,Acme/Hidden").unwrap();
+
+        assert!(is_repo_excluded_with_mode(
+            "acme/hidden",
+            &rules,
+            RepoMatchMode::Github
+        ));
+        assert_eq!(
+            excluded_langs_for_repo_with_mode("ACME/WIDGET", &rules, RepoMatchMode::Github),
+            vec!["Rust"]
+        );
     }
 
     #[test]

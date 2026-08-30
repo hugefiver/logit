@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::cli::{GroupBy, Period};
-use crate::git::author::commit_involves_author;
-use crate::stats::models::{AuthorStats, CommitStats, GroupNode, LangStats, PeriodStats};
+use crate::git::author::{commit_identity_key, commit_involves_author};
+use crate::stats::models::{Author, AuthorStats, CommitStats, GroupNode, LangStats, PeriodStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSource {
@@ -155,8 +155,12 @@ pub fn local_group_cardinality(
         }
 
         repos.insert(commit.repo.as_str());
-        authors.insert(commit.author.to_string());
-        authors.extend(commit.co_authors.iter().map(ToString::to_string));
+        authors.insert(commit_identity_key(&commit.author));
+        authors.extend(
+            deduplicated_co_authors(&commit.author, &commit.co_authors)
+                .into_iter()
+                .map(commit_identity_key),
+        );
         periods.insert(bucket_timestamp(&commit.timestamp, period));
         for file_change in &commit.file_changes {
             if language_matches_filter(file_change.language.as_deref(), lang_filter) {
@@ -189,6 +193,15 @@ fn commit_matches_filters(
 fn language_matches_filter(language: Option<&str>, lang_filter: Option<&str>) -> bool {
     lang_filter
         .is_none_or(|filter| language.is_some_and(|language| language.eq_ignore_ascii_case(filter)))
+}
+
+/// Defensively normalize co-authors from synthetic or legacy commit statistics.
+pub fn deduplicated_co_authors<'a>(primary: &Author, co_authors: &'a [Author]) -> Vec<&'a Author> {
+    let mut seen = HashSet::from([commit_identity_key(primary)]);
+    co_authors
+        .iter()
+        .filter(|author| seen.insert(commit_identity_key(author)))
+        .collect()
 }
 
 /// Bucket a timestamp into a period label string.
@@ -271,7 +284,8 @@ where
         let author_entry = ps.by_author.entry(author_key.clone()).or_default();
         author_entry.commits += 1;
 
-        for co in &commit.co_authors {
+        let co_authors = deduplicated_co_authors(&commit.author, &commit.co_authors);
+        for co in &co_authors {
             let co_key = co.to_string();
             let co_entry = ps.by_author.entry(co_key).or_default();
             co_entry.co_authored_commits += 1;
@@ -311,7 +325,7 @@ where
                 author_lang.net_additions += fc.net_additions;
             }
 
-            for co in &commit.co_authors {
+            for co in &co_authors {
                 let co_key = co.to_string();
                 let co_entry = ps.by_author.get_mut(&co_key).expect("just inserted");
                 co_entry.co_authored_additions += fc.additions;
@@ -520,12 +534,11 @@ fn group_keys(commit: &CommitStats, group: &GroupBy, period: &Period) -> Vec<Str
         GroupBy::Repo => vec![commit.repo.clone()],
         GroupBy::Author => {
             let mut keys = vec![commit.author.to_string()];
-            for co_author in &commit.co_authors {
-                let key = co_author.to_string();
-                if !keys.contains(&key) {
-                    keys.push(key);
-                }
-            }
+            keys.extend(
+                deduplicated_co_authors(&commit.author, &commit.co_authors)
+                    .into_iter()
+                    .map(ToString::to_string),
+            );
             keys
         }
         GroupBy::Period => vec![bucket_timestamp(&commit.timestamp, period)],
@@ -909,6 +922,55 @@ mod tests {
                 .by_author
                 .contains_key("Alex <alex.two@example.com>")
         );
+    }
+
+    #[test]
+    fn self_and_duplicate_coauthors_count_once_without_changing_commit_totals() {
+        let commits = vec![make_commit(
+            "Alice",
+            "alice@example.com",
+            vec![
+                Author {
+                    name: "Alias".to_string(),
+                    email: " ALICE@EXAMPLE.COM ".to_string(),
+                },
+                Author {
+                    name: "Bob".to_string(),
+                    email: "bob@example.com".to_string(),
+                },
+                Author {
+                    name: "Robert".to_string(),
+                    email: " BOB@EXAMPLE.COM ".to_string(),
+                },
+            ],
+            Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap(),
+            vec![rust_file("src/a.rs", 7, 2)],
+        )];
+
+        let periods = aggregate_commits(&commits, &Period::Month, None, None);
+        let totals = aggregate_totals(&periods);
+
+        assert_eq!(totals.total_commits, 1);
+        assert_eq!(totals.by_author.len(), 2);
+        assert_eq!(totals.by_author["Alice <alice@example.com>"].commits, 1);
+        assert_eq!(
+            totals.by_author["Bob <bob@example.com>"].co_authored_commits,
+            1
+        );
+        assert_eq!(
+            totals.by_author["Bob <bob@example.com>"].co_authored_additions,
+            7
+        );
+
+        let nodes = build_group_tree(
+            &commits,
+            &[GroupBy::Author, GroupBy::Language],
+            &Period::Month,
+            None,
+            None,
+        );
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().all(|node| node.stats.total_commits == 1));
     }
 
     #[test]
@@ -1372,10 +1434,20 @@ mod tests {
             "repo-a",
             "Alice",
             "alice@example.com",
-            vec![Author {
-                name: "Bob".to_string(),
-                email: "bob@example.com".to_string(),
-            }],
+            vec![
+                Author {
+                    name: "Alias".to_string(),
+                    email: " ALICE@EXAMPLE.COM ".to_string(),
+                },
+                Author {
+                    name: "Bob".to_string(),
+                    email: "bob@example.com".to_string(),
+                },
+                Author {
+                    name: "Robert".to_string(),
+                    email: " BOB@EXAMPLE.COM ".to_string(),
+                },
+            ],
             Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap(),
             vec![rust_file("src/a.rs", 7, 2)],
         )];

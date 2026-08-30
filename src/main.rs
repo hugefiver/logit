@@ -124,12 +124,20 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
 
     let commits =
         filter_commits_for_stats(commits, args.committer.as_deref(), args.lang.as_deref());
+    if commits.is_empty() {
+        eprintln!("commits exist in the given period, but none matched the requested filters.");
+        return Ok(());
+    }
 
     let active_repos: std::collections::HashSet<&str> =
         commits.iter().map(|c| c.repo_id.as_str()).collect();
     let skipped = repos.len() - active_repos.len();
     if skipped > 0 {
-        eprintln!("Skipped {skipped} repo(s) with no activity in the period.");
+        if args.committer.is_some() || args.lang.is_some() {
+            eprintln!("Skipped {skipped} repo(s) with no commits matching the requested filters.");
+        } else {
+            eprintln!("Skipped {skipped} repo(s) with no activity in the period.");
+        }
     }
 
     let identity_map = build_identity_map(&args.dedup, &repos, &commits);
@@ -363,13 +371,17 @@ fn duration_for_days(days: f64, flag: &str) -> anyhow::Result<chrono::Duration> 
         anyhow::bail!("{flag} must be a finite number greater than zero");
     }
 
-    let seconds = days * 86_400.0;
-    if !seconds.is_finite() || seconds > i64::MAX as f64 {
+    let seconds = (days * 86_400.0).ceil();
+    if !seconds.is_finite() || seconds >= i64::MAX as f64 {
         anyhow::bail!("{flag} duration is too large");
     }
 
-    chrono::Duration::try_seconds(seconds as i64)
-        .ok_or_else(|| anyhow::anyhow!("{flag} duration is too large"))
+    let duration = chrono::Duration::try_seconds(seconds as i64)
+        .ok_or_else(|| anyhow::anyhow!("{flag} duration is too large"))?;
+    if duration.num_nanoseconds().is_none() {
+        anyhow::bail!("{flag} duration is too large");
+    }
+    Ok(duration)
 }
 
 fn resolve_time_range(
@@ -412,6 +424,81 @@ fn resolve_time_range(
     Ok(TimeRange {
         since,
         until_exclusive,
+    })
+}
+
+#[cfg(feature = "github")]
+fn resolve_github_query_window(
+    days: Option<f64>,
+    since: Option<&str>,
+    until: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> anyhow::Result<github::api::QueryWindow> {
+    use github::api::CacheWindowScope;
+
+    let explicit_since = if days.is_some() {
+        None
+    } else {
+        since
+            .map(|value| parse_date(value, "--since"))
+            .transpose()?
+    };
+    if explicit_since.is_some_and(|from| from > observed_at) {
+        anyhow::bail!("--since must not be in the future");
+    }
+
+    let explicit_until = until
+        .map(|value| -> anyhow::Result<DateTime<Utc>> {
+            let date = parse_date(value, "--until")?.date_naive();
+            let next_date = date
+                .succ_opt()
+                .ok_or_else(|| anyhow::anyhow!("--until date '{value}' is out of range"))?;
+            let midnight = next_date
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight (00:00:00) is always a valid time");
+            Ok(midnight.and_utc())
+        })
+        .transpose()?;
+    let elapsed_until = explicit_until.filter(|end| *end <= observed_at);
+    let duration = if explicit_since.is_none() {
+        Some(duration_for_days(days.unwrap_or(365.0), "--days")?)
+    } else {
+        None
+    };
+    let duration_start = elapsed_until.unwrap_or(observed_at);
+    let requested_from = match (explicit_since, duration) {
+        (Some(from), _) => from,
+        (None, Some(duration)) => duration_start
+            .checked_sub_signed(duration)
+            .ok_or_else(|| anyhow::anyhow!("--days duration is too large"))?,
+        (None, None) => unreachable!("a GitHub query must have a start boundary"),
+    };
+    let until_exclusive = elapsed_until.unwrap_or(observed_at);
+
+    if requested_from >= until_exclusive {
+        anyhow::bail!("--since must not be after --until");
+    }
+
+    let scope = match (elapsed_until, explicit_since, duration) {
+        (Some(until_exclusive), _, _) => CacheWindowScope::Fixed {
+            from: requested_from,
+            until_exclusive,
+        },
+        (None, Some(from), _) => CacheWindowScope::Anchored { from },
+        (None, None, Some(duration)) => CacheWindowScope::Rolling {
+            lookback_nanoseconds: duration
+                .num_nanoseconds()
+                .expect("duration_for_days rejects cache scope overflow"),
+        },
+        (None, None, None) => unreachable!("a rolling GitHub query needs a duration"),
+    };
+
+    Ok(github::api::QueryWindow {
+        scope,
+        requested_from,
+        until_exclusive,
+        observed_at,
+        completed: elapsed_until.is_some(),
     })
 }
 
@@ -521,7 +608,13 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
             );
         }
         let before = contributions.len();
-        contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
+        contributions.retain(|c| {
+            !exclude::is_repo_excluded_with_mode(
+                &c.repo_name,
+                &exclude_rules,
+                exclude::RepoMatchMode::Github,
+            )
+        });
         if contributions.len() < before {
             eprintln!(
                 "Excluded {} repo(s) via --exclude",
@@ -529,7 +622,11 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
             );
         }
         for c in &mut contributions {
-            let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
+            let langs = exclude::excluded_langs_for_repo_with_mode(
+                &c.repo_name,
+                &exclude_rules,
+                exclude::RepoMatchMode::Github,
+            );
             for lang in langs {
                 c.languages.retain(|l, _| !l.eq_ignore_ascii_case(&lang));
             }
@@ -753,9 +850,19 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
                     "Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)"
                 );
             }
-            contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
+            contributions.retain(|c| {
+                !exclude::is_repo_excluded_with_mode(
+                    &c.repo_name,
+                    &exclude_rules,
+                    exclude::RepoMatchMode::Github,
+                )
+            });
             for c in &mut contributions {
-                let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
+                let langs = exclude::excluded_langs_for_repo_with_mode(
+                    &c.repo_name,
+                    &exclude_rules,
+                    exclude::RepoMatchMode::Github,
+                );
                 for lang in langs {
                     c.languages.retain(|l, _| !l.eq_ignore_ascii_case(&lang));
                 }
@@ -892,20 +999,19 @@ fn fetch_github_data(
     github::ContributionSummary,
     u64,
 )> {
-    let now = Utc::now();
-    let time_range = resolve_time_range(days, since, until, now)?;
+    let observed_at = Utc::now();
+    let query_window = resolve_github_query_window(days, since, until, observed_at)?;
+    let (cache_policy, warn_no_cache_override) =
+        github::api::CachePolicy::from_flags(no_cache, refresh_cache);
+    if warn_no_cache_override {
+        eprintln!("Warning: --no-cache overrides --refresh-cache; cache is disabled");
+    }
     let client = github::GithubClient::new()?;
     if !client.has_token() {
         anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
     }
 
     let user = client.get_user(username)?;
-
-    let since_ts = time_range.since.map(|date| date.timestamp());
-    let until_ts = time_range.until_exclusive.map(|date| date.timestamp());
-
-    let read_cache = !no_cache;
-    let write_cache = refresh_cache;
 
     let (contributions, contribution_summary) = github::api::fetch_user_stats(
         &client,
@@ -914,16 +1020,14 @@ fn fetch_github_data(
         include_forks,
         include_contributed,
         include_private,
-        since_ts,
-        until_ts,
-        read_cache,
-        write_cache,
+        &query_window,
+        cache_policy,
     )?;
 
     let days_value = if let Some(days) = days {
         days.ceil() as u64
-    } else if let Some(since_dt) = time_range.since {
-        let diff = now - since_dt;
+    } else if since.is_some() {
+        let diff = observed_at - query_window.requested_from;
         diff.num_days().max(1) as u64
     } else {
         365
@@ -957,25 +1061,22 @@ fn parse_period(s: &str) -> anyhow::Result<f64> {
     if !days.is_finite() || days <= 0.0 {
         anyhow::bail!("Invalid period '{s}': numeric periods must be finite and greater than zero");
     }
-    duration_for_days(days, "period").map_err(|e| anyhow::anyhow!("Invalid period '{s}': {e}"))?;
+    duration_for_days(days, "period")
+        .map_err(|e| anyhow::anyhow!("Invalid period '{s}': range is too large: {e}"))?;
     Ok(days)
 }
 
 #[cfg(feature = "github")]
 fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
-    let now = Utc::now();
-    let periods: Vec<(f64, i64)> = args
+    let observed_at = Utc::now();
+    let periods: Vec<(f64, github::api::QueryWindow)> = args
         .periods
         .iter()
         .map(|period| {
             let days = parse_period(period)?;
-            let duration = duration_for_days(days, "period")?;
-            let since = now.checked_sub_signed(duration).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid period '{period}': range is too large for the requested duration"
-                )
-            })?;
-            Ok((days, since.timestamp()))
+            let query_window = resolve_github_query_window(Some(days), None, None, observed_at)
+                .map_err(|error| anyhow::anyhow!("Invalid period '{period}': {error}"))?;
+            Ok((days, query_window))
         })
         .collect::<anyhow::Result<_>>()?;
     let exclude_rules: Vec<exclude::ExcludeRule> = args
@@ -986,14 +1087,17 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
         .into_iter()
         .flatten()
         .collect();
+    let (cache_policy, warn_no_cache_override) =
+        github::api::CachePolicy::from_flags(args.no_cache, args.refresh_cache);
+    if warn_no_cache_override {
+        eprintln!("Warning: --no-cache overrides --refresh-cache; cache is disabled");
+    }
     let client = github::GithubClient::new()?;
     if !client.has_token() {
         anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
     }
 
     let user = client.get_user(&args.username)?;
-    let read_cache = !args.no_cache;
-    let write_cache = args.refresh_cache;
 
     if exclude::any_path_rules(&exclude_rules) {
         eprintln!(
@@ -1002,9 +1106,7 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
     }
 
     let mut columns = Vec::new();
-    for (days, since_timestamp) in periods {
-        let since_ts = Some(since_timestamp);
-
+    for (days, query_window) in periods {
         let (mut contributions, _summary) = github::api::fetch_user_stats(
             &client,
             &user.node_id,
@@ -1012,16 +1114,24 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
             args.include_forks,
             args.include_contributed,
             args.include_private,
-            since_ts,
-            None,
-            read_cache,
-            write_cache,
+            &query_window,
+            cache_policy,
         )?;
 
         if !exclude_rules.is_empty() {
-            contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
+            contributions.retain(|c| {
+                !exclude::is_repo_excluded_with_mode(
+                    &c.repo_name,
+                    &exclude_rules,
+                    exclude::RepoMatchMode::Github,
+                )
+            });
             for c in &mut contributions {
-                let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
+                let langs = exclude::excluded_langs_for_repo_with_mode(
+                    &c.repo_name,
+                    &exclude_rules,
+                    exclude::RepoMatchMode::Github,
+                );
                 for lang in langs {
                     c.languages.retain(|l, _| !l.eq_ignore_ascii_case(&lang));
                 }
@@ -1096,6 +1206,97 @@ mod tests {
                 "expected {days:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn positive_fractional_days_round_up_to_one_second() {
+        assert_eq!(
+            duration_for_days(0.000_001, "--days")
+                .unwrap()
+                .num_seconds(),
+            1
+        );
+        assert_eq!(
+            duration_for_days(0.5, "--days").unwrap().num_seconds(),
+            12 * 60 * 60
+        );
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn github_query_windows_use_one_clock_and_semantic_scopes() {
+        use github::api::{CachePolicy, CacheWindowScope};
+
+        let observed_at = fixed_now();
+        let rolling = resolve_github_query_window(Some(0.5), None, None, observed_at).unwrap();
+        assert_eq!(
+            rolling.scope,
+            CacheWindowScope::Rolling {
+                lookback_nanoseconds: 43_200_000_000_000,
+            }
+        );
+        assert_eq!(
+            rolling.requested_from,
+            observed_at - chrono::Duration::hours(12)
+        );
+        assert_eq!(rolling.until_exclusive, observed_at);
+        assert!(!rolling.completed);
+
+        let rolling_with_future_until =
+            resolve_github_query_window(Some(0.5), None, Some("2025-02-20"), observed_at).unwrap();
+        assert_eq!(
+            rolling_with_future_until.scope,
+            CacheWindowScope::Rolling {
+                lookback_nanoseconds: 43_200_000_000_000,
+            }
+        );
+        assert_eq!(
+            rolling_with_future_until.requested_from,
+            observed_at - chrono::Duration::hours(12)
+        );
+        assert_eq!(rolling_with_future_until.until_exclusive, observed_at);
+        assert!(!rolling_with_future_until.completed);
+
+        let anchored =
+            resolve_github_query_window(None, Some("2025-02-01"), None, observed_at).unwrap();
+        assert_eq!(
+            anchored.scope,
+            CacheWindowScope::Anchored {
+                from: Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).single().unwrap(),
+            }
+        );
+        assert_eq!(anchored.until_exclusive, observed_at);
+        assert!(!anchored.completed);
+
+        let anchored_with_future_until =
+            resolve_github_query_window(None, Some("2025-02-01"), Some("2025-02-20"), observed_at)
+                .unwrap();
+        assert_eq!(
+            anchored_with_future_until.scope,
+            CacheWindowScope::Anchored {
+                from: Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).single().unwrap(),
+            }
+        );
+        assert_eq!(anchored_with_future_until.until_exclusive, observed_at);
+        assert!(!anchored_with_future_until.completed);
+
+        let fixed =
+            resolve_github_query_window(None, Some("2025-02-01"), Some("2025-02-02"), observed_at)
+                .unwrap();
+        assert_eq!(
+            fixed.scope,
+            CacheWindowScope::Fixed {
+                from: Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).single().unwrap(),
+                until_exclusive: Utc.with_ymd_and_hms(2025, 2, 3, 0, 0, 0).single().unwrap(),
+            }
+        );
+        assert!(fixed.completed);
+
+        let (policy, warn) = CachePolicy::from_flags(true, true);
+        assert_eq!(policy, CachePolicy::Disabled);
+        assert!(warn);
+        assert!(!policy.can_read());
+        assert!(!policy.can_write());
     }
 
     #[cfg(feature = "github")]

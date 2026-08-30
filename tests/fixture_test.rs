@@ -39,6 +39,47 @@ fn github_multi_rejects_out_of_range_period_before_token_check() {
     assert!(!stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
 }
 
+#[cfg(feature = "github")]
+#[test]
+fn github_future_since_is_rejected_before_token_or_network() {
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args(["github", "fetch", "octocat", "--since", "2999-01-01"])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run logit github fetch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--since") && stderr.contains("future"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
+}
+
+#[cfg(feature = "github")]
+#[test]
+fn github_no_cache_refresh_conflict_warns_exactly_once() {
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args([
+            "github",
+            "fetch",
+            "octocat",
+            "--no-cache",
+            "--refresh-cache",
+        ])
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("run logit github fetch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = "Warning: --no-cache overrides --refresh-cache; cache is disabled";
+
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert_eq!(stderr.matches(warning).count(), 1, "stderr: {stderr}");
+}
+
 fn successful_stats_json(paths: &[&std::path::Path], selectors: &[&str]) -> Value {
     let output = run_stats_json(paths, selectors);
     assert!(
@@ -47,6 +88,46 @@ fn successful_stats_json(paths: &[&std::path::Path], selectors: &[&str]) -> Valu
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("stats JSON output")
+}
+
+fn append_commit_with_committer(repo: &git2::Repository, committer_name: &str) {
+    let parent = repo
+        .head()
+        .expect("fixture HEAD")
+        .peel_to_commit()
+        .expect("fixture HEAD commit");
+    let parent_tree = parent.tree().expect("fixture parent tree");
+    let blob = repo.blob(b"filtered commit\n").expect("filtered blob");
+    let mut tree_builder = repo
+        .treebuilder(Some(&parent_tree))
+        .expect("filtered tree builder");
+    tree_builder
+        .insert("filtered.txt", blob, 0o100644)
+        .expect("insert filtered file");
+    let tree = repo
+        .find_tree(tree_builder.write().expect("write filtered tree"))
+        .expect("find filtered tree");
+    let author = git2::Signature::new(
+        "Filter Author",
+        "filter-author@test.com",
+        &git2::Time::new(1_709_000_000, 0),
+    )
+    .expect("filtered author signature");
+    let committer = git2::Signature::new(
+        committer_name,
+        "matching-committer@test.com",
+        &git2::Time::new(1_709_000_000, 0),
+    )
+    .expect("filtered committer signature");
+    repo.commit(
+        Some("HEAD"),
+        &author,
+        &committer,
+        "Add filtered commit",
+        &tree,
+        &[&parent],
+    )
+    .expect("commit filtered fixture change");
 }
 
 #[test]
@@ -163,6 +244,76 @@ fn cli_committer_matches_name_and_email() {
 
         assert_eq!(json["totals"]["total_commits"], 1, "pattern: {pattern}");
     }
+}
+
+#[test]
+fn cli_filter_empty_diagnostic_is_not_no_commits_diagnostic() {
+    let tmp = TempDir::new().unwrap();
+    let _repo = common::create_test_repo(tmp.path());
+
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args([
+            "stats",
+            tmp.path().to_str().expect("UTF-8 temporary path"),
+            "--committer",
+            "does-not-exist",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run filtered stats");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(stderr.contains("commits exist"), "stderr: {stderr}");
+    assert!(stderr.contains("filters"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("No commits found in the given period."),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn cli_partial_committer_filter_reports_matching_filters_for_skipped_repositories() {
+    let tmp = TempDir::new().unwrap();
+    let matching_path = tmp.path().join("matching");
+    let skipped_path = tmp.path().join("skipped");
+    fs::create_dir_all(&matching_path).expect("create matching repository parent");
+    fs::create_dir_all(&skipped_path).expect("create skipped repository parent");
+    let matching_repo = common::create_test_repo(&matching_path);
+    let _skipped_repo = common::create_test_repo(&skipped_path);
+    append_commit_with_committer(&matching_repo, "Matching Bot");
+
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .arg("stats")
+        .arg(tmp.path())
+        .args([
+            "--committer",
+            "Matching Bot",
+            "--group",
+            "repo",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run partially filtered stats");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("stats JSON output");
+    assert_eq!(json["totals"]["total_commits"], 1);
+    let periods = json["periods"].as_array().expect("repo periods array");
+    assert_eq!(periods.len(), 1);
+    assert_eq!(periods[0]["period_label"], "matching");
+    assert!(stderr.contains("matching"), "stderr: {stderr}");
+    assert!(stderr.contains("filters"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("no activity in the period"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -340,6 +491,21 @@ fn cli_repo_selector_accepts_exact_normalized_identity_and_unique_basename() {
 
     let selected_by_basename = successful_stats_json(&[tmp.path()], &["unique"]);
     assert_eq!(selected_by_basename["totals"]["total_commits"], 5);
+}
+
+#[cfg(windows)]
+#[test]
+fn cli_repo_selector_matches_display_label_case_insensitively_on_windows() {
+    let tmp = TempDir::new().unwrap();
+    let team = tmp.path().join("Team").join("Service");
+    let other = tmp.path().join("Other").join("Service");
+    fs::create_dir_all(&team).expect("create Team/Service parent");
+    fs::create_dir_all(&other).expect("create Other/Service parent");
+    let _team_repo = common::create_test_repo(&team);
+    let _other_repo = common::create_test_repo(&other);
+
+    let selected = successful_stats_json(&[tmp.path()], &["team/service"]);
+    assert_eq!(selected["totals"]["total_commits"], 5);
 }
 
 #[test]
