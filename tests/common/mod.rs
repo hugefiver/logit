@@ -67,6 +67,12 @@ fn make_commit_1(repo: &Repository) -> Oid {
 fn make_commit_2(repo: &Repository, parent_oid: Oid) -> Oid {
     let sig =
         Signature::new("Bob", "bob@test.com", &Time::new(1_705_413_600, 0)).expect("signature");
+    let committer_sig = Signature::new(
+        "Release Bot",
+        "release-bot@test.com",
+        &Time::new(1_705_413_600, 0),
+    )
+    .expect("committer signature");
 
     let main_rs = concat!(
         "fn main() {\n",
@@ -128,7 +134,7 @@ fn make_commit_2(repo: &Repository, parent_oid: Oid) -> Oid {
     repo.commit(
         Some("HEAD"),
         &sig,
-        &sig,
+        &committer_sig,
         "Add Python library",
         &tree,
         &[&parent],

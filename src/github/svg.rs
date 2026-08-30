@@ -2,8 +2,8 @@ use serde::Serialize;
 use tera::{Context, Tera};
 
 use crate::cli::NumberFormat;
-use crate::github::api::GithubUser;
 use crate::github::ContributionSummary;
+use crate::github::api::GithubUser;
 use crate::output::table::format_num;
 use crate::stats::models::PeriodStats;
 
@@ -117,7 +117,7 @@ pub fn render_profile_card(
     custom_title: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut tera = Tera::default();
-    tera.add_raw_template("card", TEMPLATE)?;
+    tera.add_raw_template("profile_card.xml", TEMPLATE)?;
 
     let total_commits = stats.map_or(0, |s| s.total_commits);
     let total_additions = stats.map_or(0, |s| s.total_additions);
@@ -173,7 +173,7 @@ pub fn render_profile_card(
     ctx.insert("lang_title_y", &lang_title_y);
     ctx.insert("lang_bar_y", &lang_bar_y);
 
-    Ok(tera.render("card", &ctx)?)
+    Ok(tera.render("profile_card.xml", &ctx)?)
 }
 
 pub fn render_multi_card(
@@ -182,7 +182,7 @@ pub fn render_multi_card(
     num_fmt_lines: Option<NumberFormat>,
 ) -> anyhow::Result<String> {
     let mut tera = Tera::default();
-    tera.add_raw_template("multi", MULTI_TEMPLATE)?;
+    tera.add_raw_template("multi_card.xml", MULTI_TEMPLATE)?;
 
     let margin = 25usize;
     let col_width = 200usize;
@@ -299,7 +299,7 @@ pub fn render_multi_card(
     ctx.insert("card_height", &card_height);
     ctx.insert("columns", &columns);
 
-    Ok(tera.render("multi", &ctx)?)
+    Ok(tera.render("multi_card.xml", &ctx)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -874,5 +874,66 @@ mod tests {
 
         assert!(svg.contains("Custom"));
         assert!(!svg.contains("Recent 30 days"));
+    }
+
+    #[test]
+    fn profile_svg_escapes_all_dynamic_xml_metacharacters() {
+        let payload = r#"<script id="owned">&"'</script>"#;
+        let escaped_prefix = "&lt;script id=&quot;owned&quot;&gt;&amp;&quot;&#x27;&lt;";
+        let escaped_closing_tag = "&#x2F;script&gt;";
+        let user = make_user(8);
+        let mut stats = make_stats();
+        let language = stats
+            .by_language
+            .remove("Rust")
+            .expect("Rust test language");
+        stats.by_language.insert(payload.to_string(), language);
+
+        let svg = render_profile_card(
+            payload,
+            &user,
+            Some(&stats),
+            5,
+            &ContributionSummary::default(),
+            30,
+            false,
+            NumberFormat::Plain,
+            None,
+            2,
+            Some(payload),
+        )
+        .unwrap();
+
+        assert!(
+            svg.matches(escaped_prefix).count() >= 3,
+            "expected all dynamic values to use the exact XML entities: {svg}"
+        );
+        assert!(svg.contains(escaped_closing_tag));
+        assert!(!svg.contains("<script id=\"owned\">"));
+        assert!(!svg.contains("id=\"owned\""));
+        assert!(!svg.contains("</script>"));
+    }
+
+    #[test]
+    fn multi_svg_escapes_json_derived_language_names() {
+        let payload = r#"x" onload="alert(1)&<tag>'"#;
+        let escaped = "x&quot; onload=&quot;alert(1)&amp;&lt;tag&gt;&#x27;";
+        let mut stats = make_stats();
+        let language = stats
+            .by_language
+            .remove("Rust")
+            .expect("Rust test language");
+        stats.by_language.insert(payload.to_string(), language);
+        let columns = [MultiColumnData {
+            days: 30,
+            stats,
+            active_repos: 5,
+        }];
+
+        let svg = render_multi_card(&columns, NumberFormat::Plain, None).unwrap();
+
+        assert!(svg.contains(escaped));
+        assert!(!svg.contains("onload=\"alert(1)\""));
+        assert!(!svg.contains("<tag>"));
     }
 }

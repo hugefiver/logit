@@ -96,7 +96,7 @@ pub struct StatsArgs {
         value_enum,
         value_delimiter = ',',
         default_value = "repo,author,language",
-        help = "Single-level grouping with fallback. Tries each in order and uses the first level that has more than one distinct value."
+        help = "Ordered primary fallback. Uses the first level with more than one distinct value; a single explicit non-language level is retained even when unique."
     )]
     pub group: Vec<GroupBy>,
 
@@ -104,7 +104,7 @@ pub struct StatsArgs {
         long = "groups",
         value_enum,
         value_delimiter = ',',
-        help = "Multi-level grouping displayed as a tree (comma-separated, e.g. repo,author,period). Overrides --group."
+        help = "Nested subgroup levels under the selected --group primary (comma-separated, e.g. author,period)."
     )]
     pub groups: Vec<GroupBy>,
 
@@ -321,10 +321,18 @@ pub struct GithubFetchArgs {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "repo,author,language",
-        help = "Single-level grouping with fallback. Tries each in order and uses the first level that has more than one distinct value."
+        default_value = "repo,language",
+        help = "Ordered primary fallback. Uses the first supported level with more than one distinct value; a single explicit non-language level is retained even when unique. GitHub supports repo, period, and language."
     )]
     pub group: Vec<GroupBy>,
+
+    #[arg(
+        long = "groups",
+        value_enum,
+        value_delimiter = ',',
+        help = "Nested subgroup levels under the selected --group primary (comma-separated, e.g. period,language). GitHub supports repo, period, and language."
+    )]
+    pub groups: Vec<GroupBy>,
 
     #[arg(long, value_enum, default_value_t = NumberFormat::Separated, help = "Number display format")]
     pub number_format: NumberFormat,
@@ -548,5 +556,41 @@ mod tests {
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn stats_help_describes_fallback_and_subgroups() {
+        let mut command = Cli::command();
+        let stats = command.find_subcommand_mut("stats").unwrap();
+        let help = stats.render_long_help().to_string();
+
+        assert!(help.contains("fallback"), "help: {help}");
+        assert!(help.contains("subgroup"), "help: {help}");
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn github_fetch_help_defaults_and_parses_subgroups() {
+        let mut command = Cli::command();
+        let github = command.find_subcommand_mut("github").unwrap();
+        let fetch = github.find_subcommand_mut("fetch").unwrap();
+        let help = fetch.render_long_help().to_string();
+        assert!(help.contains("fallback"), "help: {help}");
+        assert!(help.contains("subgroup"), "help: {help}");
+
+        let parsed = Cli::try_parse_from([
+            "logit",
+            "github",
+            "fetch",
+            "octocat",
+            "--groups",
+            "repo,period",
+        ])
+        .unwrap();
+        let Commands::Github(GithubSubcommand::Fetch(args)) = parsed.command else {
+            panic!("expected github fetch arguments");
+        };
+        assert_eq!(args.group, vec![GroupBy::Repo, GroupBy::Language]);
+        assert_eq!(args.groups, vec![GroupBy::Repo, GroupBy::Period]);
     }
 }

@@ -2,46 +2,87 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+pub struct ScanReport {
+    pub repos: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
 /// Recursively scan for git repositories under `root`.
 ///
 /// Returns sorted list of repo root paths. Uses stack-based iterative DFS.
 /// Does not descend into discovered repositories. Skips symlinks.
-pub fn scan_for_repos(root: &Path) -> Result<Vec<PathBuf>> {
+pub fn scan_for_repos(root: &Path) -> Result<ScanReport> {
     anyhow::ensure!(
         root.is_dir(),
         "path '{}' does not exist or is not a directory",
         root.display()
     );
 
-    let mut results = Vec::new();
+    let mut report = ScanReport {
+        repos: Vec::new(),
+        warnings: Vec::new(),
+    };
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
+        let git_marker = dir.join(".git");
+        match git_marker.try_exists() {
+            Ok(true) => match git2::Repository::open(&dir) {
+                Ok(_) => {
+                    report.repos.push(dir);
+                    continue;
+                }
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "cannot open repository with .git marker '{}': {e}",
+                        git_marker.display()
+                    ));
+                    continue;
+                }
+            },
+            Ok(false) => {}
+            Err(e) => {
+                report.warnings.push(format!(
+                    "cannot inspect git marker '{}': {e}",
+                    git_marker.display()
+                ));
+                continue;
+            }
+        }
+
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("warning: cannot read '{}': {e}", dir.display());
+                report
+                    .warnings
+                    .push(format!("cannot read directory '{}': {e}", dir.display()));
                 continue;
             }
         };
 
-        let git_marker = dir.join(".git");
-        if git_marker.exists() && git2::Repository::open(&dir).is_ok() {
-            results.push(dir);
-            continue;
-        }
-
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "cannot read directory entry under '{}': {e}",
+                        dir.display()
+                    ));
+                    continue;
+                }
             };
 
             let path = entry.path();
 
             let metadata = match entry.metadata() {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "cannot read metadata for '{}': {e}",
+                        path.display()
+                    ));
+                    continue;
+                }
             };
             if metadata.file_type().is_symlink() {
                 continue;
@@ -53,8 +94,8 @@ pub fn scan_for_repos(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
 
-    results.sort();
-    Ok(results)
+    report.repos.sort();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -79,7 +120,8 @@ mod tests {
         Repository::init(&repo_a).unwrap();
         Repository::init(&repo_b).unwrap();
 
-        let repos = scan_for_repos(base).expect("scan should succeed");
+        let report = scan_for_repos(base).expect("scan should succeed");
+        let repos = report.repos;
         assert_eq!(
             repos.len(),
             2,
@@ -92,7 +134,8 @@ mod tests {
     #[test]
     fn empty_directory_returns_empty() {
         let tmp = TempDir::new().unwrap();
-        let repos = scan_for_repos(tmp.path()).expect("scan should succeed");
+        let report = scan_for_repos(tmp.path()).expect("scan should succeed");
+        let repos = report.repos;
         assert!(repos.is_empty());
     }
 
@@ -116,7 +159,8 @@ mod tests {
             Repository::init(dir).unwrap();
         }
 
-        let repos = scan_for_repos(base).expect("scan should succeed");
+        let report = scan_for_repos(base).expect("scan should succeed");
+        let repos = report.repos;
         assert_eq!(repos.len(), 3);
         assert_eq!(repos[0], repo_a);
         assert_eq!(repos[1], repo_b);
@@ -131,7 +175,8 @@ mod tests {
         let non_repo = base.join("not-a-repo");
         std::fs::create_dir_all(&non_repo).unwrap();
 
-        let repos = scan_for_repos(base).expect("scan should succeed");
+        let report = scan_for_repos(base).expect("scan should succeed");
+        let repos = report.repos;
         assert!(repos.is_empty());
     }
 
@@ -148,8 +193,23 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         Repository::init(&inner).unwrap();
 
-        let repos = scan_for_repos(base).expect("scan should succeed");
+        let report = scan_for_repos(base).expect("scan should succeed");
+        let repos = report.repos;
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0], outer);
+    }
+
+    #[test]
+    fn invalid_git_marker_is_reported_once() {
+        let tmp = TempDir::new().unwrap();
+        let invalid_repo = tmp.path().join("invalid-repo");
+        std::fs::create_dir_all(&invalid_repo).unwrap();
+        std::fs::write(invalid_repo.join(".git"), "not a git directory").unwrap();
+
+        let report = scan_for_repos(tmp.path()).expect("scan should succeed");
+
+        assert!(report.repos.is_empty());
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(report.warnings[0].contains(".git"));
     }
 }

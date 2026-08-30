@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use git2::{Commit, DiffFormat, DiffOptions, Repository};
+use git2::{Commit, DiffFindOptions, DiffFormat, DiffOptions, Repository};
 
 use crate::stats::models::FileChange;
 
@@ -10,6 +10,10 @@ use crate::stats::models::FileChange;
 /// Returns per-file addition/deletion counts.
 /// The `language` field is left as `None` — caller should apply language classification.
 pub fn analyze_commit_diff(repo: &Repository, commit: &Commit) -> Result<Vec<FileChange>> {
+    if commit.parent_count() > 1 {
+        return Ok(Vec::new());
+    }
+
     let commit_tree = commit.tree().context("Failed to get commit tree")?;
 
     let parent_tree = if commit.parent_count() > 0 {
@@ -27,11 +31,23 @@ pub fn analyze_commit_diff(repo: &Repository, commit: &Commit) -> Result<Vec<Fil
     let mut opts = DiffOptions::new();
     opts.ignore_submodules(true);
 
-    let diff = repo
+    let mut diff = repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(&mut opts))
         .context("Failed to compute diff")?;
+    let mut find = DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))
+        .context("Failed to find similar files")?;
 
     let mut file_stats: HashMap<String, (u64, u64)> = HashMap::new();
+
+    for delta in diff.deltas() {
+        if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+            file_stats
+                .entry(path.to_string_lossy().to_string())
+                .or_insert((0, 0));
+        }
+    }
 
     diff.print(DiffFormat::Patch, |delta, _hunk, line| {
         if !delta.flags().is_binary() {
@@ -179,5 +195,53 @@ mod tests {
         assert_eq!(changes[0].additions, 1);
         assert_eq!(changes[1].path, "b.txt");
         assert_eq!(changes[1].additions, 2);
+    }
+
+    #[test]
+    fn pure_rename_is_one_zero_churn_file_change() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let oid = create_initial_commit(&repo, &[("old.rs", "fn renamed() {}\n")]);
+        let parent = repo.find_commit(oid).unwrap();
+        let parent_tree = parent.tree().unwrap();
+        let blob = repo.blob(b"fn renamed() {}\n").unwrap();
+        let mut tree_builder = repo.treebuilder(Some(&parent_tree)).unwrap();
+        tree_builder.remove("old.rs").unwrap();
+        tree_builder.insert("new.rs", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let sig = Signature::new("Test", "test@test.com", &Time::new(1_705_413_600, 0)).unwrap();
+        let rename_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "Rename", &tree, &[&parent])
+            .unwrap();
+
+        let commit = repo.find_commit(rename_oid).unwrap();
+        let changes = analyze_commit_diff(&repo, &commit).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "new.rs");
+        assert_eq!(changes[0].additions, 0);
+        assert_eq!(changes[0].deletions, 0);
+    }
+
+    #[test]
+    fn binary_delta_is_retained_with_zero_lines() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let blob = repo.blob(b"\0binary\0content").unwrap();
+        let mut tree_builder = repo.treebuilder(None).unwrap();
+        tree_builder.insert("asset.bin", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let sig = Signature::new("Test", "test@test.com", &Time::new(1_705_312_800, 0)).unwrap();
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "Add binary", &tree, &[])
+            .unwrap();
+
+        let commit = repo.find_commit(oid).unwrap();
+        let changes = analyze_commit_diff(&repo, &commit).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "asset.bin");
+        assert_eq!(changes[0].additions, 0);
+        assert_eq!(changes[0].deletions, 0);
     }
 }

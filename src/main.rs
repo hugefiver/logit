@@ -24,6 +24,13 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 
 use cli::{Cli, Commands, GroupBy, OutputFormat, Period, ScanArgs, ScanFormat, StatsArgs};
+use stats::models::CommitStats;
+
+#[derive(Debug, Clone, Copy)]
+struct TimeRange {
+    since: Option<DateTime<Utc>>,
+    until_exclusive: Option<DateTime<Utc>>,
+}
 
 fn write_output(content: String, path: Option<&std::path::Path>) -> anyhow::Result<()> {
     if let Some(path) = path {
@@ -50,40 +57,64 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_scan(args: ScanArgs) -> anyhow::Result<()> {
-    let repos = scanner::scan_for_repos(&args.path)?;
+    let report = scanner::scan_for_repos(&args.path)?;
+    for warning in &report.warnings {
+        eprintln!("Warning: {warning}");
+    }
     let content = match args.format {
-        ScanFormat::Table => output::table::render_scan_table(&repos),
-        ScanFormat::Json => output::json::render_scan_json(&repos)?,
+        ScanFormat::Table => output::table::render_scan_table(&report.repos),
+        ScanFormat::Json => output::json::render_scan_json(&report.repos)?,
     };
     write_output(content, args.output.as_deref())
 }
 
 fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
-    let since = if let Some(days) = args.days {
-        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
-        Some(Utc::now() - duration)
-    } else {
-        args.since.as_deref().map(parse_date).transpose()?
-    };
-    let until = args
-        .until
-        .as_deref()
-        .map(parse_date)
-        .transpose()?;
+    let time_range = resolve_time_range(
+        args.days,
+        args.since.as_deref(),
+        args.until.as_deref(),
+        Utc::now(),
+    )?;
+    let since = time_range.since;
+    let until = time_range.until_exclusive;
+    let mut exclude_rules: Vec<exclude::ExcludeRule> = args
+        .exclude
+        .iter()
+        .map(|v| exclude::ExcludeRule::parse_many(v))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let mut repos: Vec<PathBuf> = Vec::new();
+    let mut scan_warnings = Vec::new();
     for path in &args.paths {
         if path.join(".git").exists() {
             repos.push(path.clone());
         } else {
-            repos.extend(scanner::scan_for_repos(path)?);
+            let report = scanner::scan_for_repos(path)?;
+            repos.extend(report.repos);
+            scan_warnings.extend(report.warnings);
         }
     }
 
+    for warning in scan_warnings {
+        eprintln!("Warning: {warning}");
+    }
+
+    let repos = analyze::normalize_repo_inputs(repos, args.repo.as_deref())?;
     let (commits, errors) = analyze::analyze_repos(&repos, since, until);
 
     for e in &errors {
-        eprintln!("Warning: failed to analyze {}: {}", e.path.display(), e.error);
+        eprintln!(
+            "Warning: analysis failed for {}: {}",
+            e.path.display(),
+            e.error
+        );
+    }
+
+    if !repos.is_empty() && errors.len() == repos.len() {
+        anyhow::bail!("failed to analyze all {} repositories", repos.len());
     }
 
     if commits.is_empty() {
@@ -91,8 +122,11 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let commits =
+        filter_commits_for_stats(commits, args.committer.as_deref(), args.lang.as_deref());
+
     let active_repos: std::collections::HashSet<&str> =
-        commits.iter().map(|c| c.repo.as_str()).collect();
+        commits.iter().map(|c| c.repo_id.as_str()).collect();
     let skipped = repos.len() - active_repos.len();
     if skipped > 0 {
         eprintln!("Skipped {skipped} repo(s) with no activity in the period.");
@@ -100,11 +134,7 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
 
     let identity_map = build_identity_map(&args.dedup, &repos, &commits);
 
-    let me_expr = args
-        .me
-        .as_deref()
-        .map(filter::parse_me_expr)
-        .transpose()?;
+    let me_expr = args.me.as_deref().map(filter::parse_me_expr).transpose()?;
 
     let commits = if let Some(ref expr) = me_expr {
         commits
@@ -114,10 +144,6 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     } else {
         commits
     };
-
-    let mut exclude_rules: Vec<exclude::ExcludeRule> = args.exclude.iter()
-        .flat_map(|v| exclude::ExcludeRule::parse_many(v))
-        .collect();
 
     #[cfg(feature = "github")]
     {
@@ -138,7 +164,9 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
                     }
                 }
                 Err(_) => {
-                    eprintln!("Warning: --exclude with @user requires GITHUB_TOKEN; skipping GitHub resolution");
+                    eprintln!(
+                        "Warning: --exclude with @user requires GITHUB_TOKEN; skipping GitHub resolution"
+                    );
                 }
             }
         }
@@ -149,71 +177,91 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
     let period = args.period.unwrap_or(Period::Month);
     let author_filter = args.author.as_deref();
     let lang_filter = args.lang.as_deref();
-    let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
+    let num_fmt = if args.short {
+        cli::NumberFormat::Short
+    } else {
+        args.number_format
+    };
     let compact = !args.no_compact;
     let columns = cli::resolve_columns(&args.columns, &args.exclude_columns);
 
-    if let Err(e) = stats::aggregator::validate_groups(&args.group) {
-        anyhow::bail!(e);
-    }
-    if let Err(e) = stats::aggregator::validate_groups(&args.groups) {
-        anyhow::bail!(e);
-    }
+    let counts =
+        stats::aggregator::local_group_cardinality(&commits, &period, author_filter, lang_filter);
+    let plan = stats::aggregator::resolve_group_plan(
+        &args.group,
+        &args.groups,
+        &counts,
+        stats::aggregator::GroupSource::Local,
+    )
+    .map_err(anyhow::Error::msg)?;
 
-    let primary_candidates =
-        stats::aggregator::effective_groups(&commits, &args.group, &period);
-    let primary = primary_candidates
-        .first()
-        .copied()
-        .unwrap_or(GroupBy::Language);
-
-    let mut effective: Vec<GroupBy> = Vec::with_capacity(1 + args.groups.len());
-    effective.push(primary);
-    for g in &args.groups {
-        if !effective.contains(g) {
-            effective.push(*g);
-        }
-    }
-    if let Err(e) = stats::aggregator::validate_groups(&effective) {
-        anyhow::bail!(e);
-    }
-
-    let use_tree = !args.groups.is_empty();
-
-    if use_tree {
+    if plan.hierarchical {
+        let mut period_stats =
+            stats::aggregator::aggregate_commits(&commits, &period, author_filter, lang_filter);
+        let mut totals = stats::aggregator::aggregate_totals(&period_stats);
         let mut nodes = stats::aggregator::build_group_tree(
-            &commits, &effective, &period, author_filter, lang_filter,
+            &commits,
+            &plan.levels,
+            &period,
+            author_filter,
+            lang_filter,
         );
 
         if !args.exclude_lang.is_empty() {
             stats::aggregator::filter_excluded_languages_tree(&mut nodes, &args.exclude_lang);
+            stats::aggregator::filter_excluded_languages(
+                &mut period_stats,
+                &mut totals,
+                &args.exclude_lang,
+            );
         }
 
         match args.format {
             OutputFormat::Table => {
-                let leaf_group = effective.last().copied().unwrap_or(GroupBy::Language);
-                let content = output::table::render_group_tree(
-                    &nodes,
-                    &leaf_group,
-                    args.sort.as_ref(),
-                    num_fmt,
-                    &columns,
-                    compact,
-                    args.inline_tree,
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Tree {
+                        nodes: &nodes,
+                        levels: &plan.levels,
+                        totals: &totals,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &args.show_email,
+                        dedup: &args.dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
                 );
+                let content = output::table::render_presentation_table(&model, num_fmt, compact);
                 write_output(content, args.output.as_deref())?;
             }
             OutputFormat::Json => {
-                let content = serde_json::to_string_pretty(&nodes)?;
+                let content = output::json::render_group_tree_json(&nodes)?;
                 write_output(content, args.output.as_deref())?;
             }
             #[cfg(feature = "tui")]
             OutputFormat::Tui => {
-                eprintln!("TUI mode does not support multi-group trees yet");
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Tree {
+                        nodes: &nodes,
+                        levels: &plan.levels,
+                        totals: &totals,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &args.show_email,
+                        dedup: &args.dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                output::tui::run_tui(&model, num_fmt, compact)?;
             }
         }
     } else {
-        let group = primary;
+        let group = plan.primary;
 
         let mut period_stats = if matches!(group, GroupBy::Repo) {
             stats::aggregator::aggregate_by_repo(&commits, author_filter, lang_filter)
@@ -232,19 +280,22 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
 
         match args.format {
             OutputFormat::Table => {
-                let content = output::table::render_stats_table(
-                    &period_stats,
-                    &totals,
-                    &group,
-                    &args.show_email,
-                    &args.dedup,
-                    &identity_map,
-                    args.sort.as_ref(),
-                    num_fmt,
-                    &columns,
-                    compact,
-                    args.inline_tree,
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Flat {
+                        stats: &period_stats,
+                        totals: &totals,
+                        primary: group,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &args.show_email,
+                        dedup: &args.dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
                 );
+                let content = output::table::render_presentation_table(&model, num_fmt, compact);
                 write_output(content, args.output.as_deref())?;
             }
             OutputFormat::Json => {
@@ -252,25 +303,121 @@ fn cmd_stats(args: StatsArgs) -> anyhow::Result<()> {
                 write_output(content, args.output.as_deref())?;
             }
             #[cfg(feature = "tui")]
-            OutputFormat::Tui => output::tui::run_tui(&period_stats, &totals, num_fmt)?,
+            OutputFormat::Tui => {
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Flat {
+                        stats: &period_stats,
+                        totals: &totals,
+                        primary: group,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &args.show_email,
+                        dedup: &args.dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                output::tui::run_tui(&model, num_fmt, compact)?;
+            }
         }
     }
 
     Ok(())
 }
 
-fn parse_date(s: &str) -> anyhow::Result<DateTime<Utc>> {
-    let naive = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|e| anyhow::anyhow!("Invalid date '{}': {}. Expected format: YYYY-MM-DD", s, e))?;
+fn filter_commits_for_stats(
+    commits: Vec<CommitStats>,
+    committer: Option<&str>,
+    language: Option<&str>,
+) -> Vec<CommitStats> {
+    commits
+        .into_iter()
+        .filter(|commit| {
+            committer.is_none_or(|pattern| commit.committer.matches(pattern))
+                && language.is_none_or(|target| {
+                    commit.file_changes.iter().any(|file_change| {
+                        file_change
+                            .language
+                            .as_deref()
+                            .is_some_and(|lang| lang.eq_ignore_ascii_case(target))
+                    })
+                })
+        })
+        .collect()
+}
+
+fn parse_date(s: &str, flag: &str) -> anyhow::Result<DateTime<Utc>> {
+    let naive = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+        anyhow::anyhow!("Invalid {flag} date '{s}': {e}. Expected format: YYYY-MM-DD")
+    })?;
     let midnight = naive
         .and_hms_opt(0, 0, 0)
         .expect("midnight (00:00:00) is always a valid time");
     Ok(midnight.and_utc())
 }
 
+fn duration_for_days(days: f64, flag: &str) -> anyhow::Result<chrono::Duration> {
+    if !days.is_finite() || days <= 0.0 {
+        anyhow::bail!("{flag} must be a finite number greater than zero");
+    }
+
+    let seconds = days * 86_400.0;
+    if !seconds.is_finite() || seconds > i64::MAX as f64 {
+        anyhow::bail!("{flag} duration is too large");
+    }
+
+    chrono::Duration::try_seconds(seconds as i64)
+        .ok_or_else(|| anyhow::anyhow!("{flag} duration is too large"))
+}
+
+fn resolve_time_range(
+    days: Option<f64>,
+    since: Option<&str>,
+    until: Option<&str>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<TimeRange> {
+    let since = if let Some(days) = days {
+        let duration = duration_for_days(days, "--days")?;
+        Some(
+            now.checked_sub_signed(duration)
+                .ok_or_else(|| anyhow::anyhow!("--days duration is too large"))?,
+        )
+    } else {
+        since
+            .map(|value| parse_date(value, "--since"))
+            .transpose()?
+    };
+    let until_exclusive = until
+        .map(|value| -> anyhow::Result<DateTime<Utc>> {
+            let date = parse_date(value, "--until")?.date_naive();
+            let next_date = date
+                .succ_opt()
+                .ok_or_else(|| anyhow::anyhow!("--until date '{value}' is out of range"))?;
+            let midnight = next_date
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight (00:00:00) is always a valid time");
+            Ok(midnight.and_utc())
+        })
+        .transpose()?;
+
+    if since
+        .zip(until_exclusive)
+        .is_some_and(|(since, until)| since >= until)
+    {
+        anyhow::bail!("--since must not be after --until");
+    }
+
+    Ok(TimeRange {
+        since,
+        until_exclusive,
+    })
+}
+
 fn build_identity_map(
     _dedup: &cli::DedupMode,
-    _repos: &[PathBuf],
+    _repos: &[analyze::RepoInput],
     _commits: &[stats::models::CommitStats],
 ) -> HashMap<String, String> {
     #[cfg(feature = "github")]
@@ -284,12 +431,12 @@ fn build_identity_map(
 
 #[cfg(feature = "github")]
 fn build_remote_identity_map(
-    repos: &[PathBuf],
+    repos: &[analyze::RepoInput],
     commits: &[stats::models::CommitStats],
 ) -> HashMap<String, String> {
     let mut github_info = None;
-    for repo_path in repos {
-        if let Some(url) = git::repo::get_remote_origin(repo_path)
+    for repo in repos {
+        if let Some(url) = git::repo::get_remote_origin(&repo.path)
             && let Some(info) = git::repo::parse_remote_url(&url)
             && matches!(info.platform, git::repo::Platform::GitHub)
         {
@@ -323,14 +470,38 @@ fn build_remote_identity_map(
         }
     };
 
-    eprintln!("Resolving {} email(s) via GitHub API ({}/{})...", all_emails.len(), info.owner, info.repo);
-    client.resolve_emails(&info.owner, &info.repo, &all_emails)
+    eprintln!(
+        "Resolving {} email(s) via GitHub API ({}/{})...",
+        all_emails.len(),
+        info.owner,
+        info.repo
+    );
+    client
+        .resolve_emails(&info.owner, &info.repo, &all_emails)
+        .into_iter()
+        .map(|(email, login)| (email.to_ascii_lowercase(), login))
+        .collect()
 }
 
 #[cfg(feature = "github")]
 fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
     use cli::FetchFormat;
 
+    stats::aggregator::validate_group_source(
+        &args.group,
+        &args.groups,
+        stats::aggregator::GroupSource::Github,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let exclude_rules: Vec<exclude::ExcludeRule> = args
+        .exclude
+        .iter()
+        .map(|v| exclude::ExcludeRule::parse_many(v))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let (user, mut contributions, contribution_summary, days_value) = fetch_github_data(
         &args.data.username,
         args.data.days,
@@ -343,17 +514,19 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
         args.data.refresh_cache,
     )?;
 
-    let exclude_rules: Vec<exclude::ExcludeRule> = args.exclude.iter()
-        .flat_map(|v| exclude::ExcludeRule::parse_many(v))
-        .collect();
     if !exclude_rules.is_empty() {
         if exclude::any_path_rules(&exclude_rules) {
-            eprintln!("Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)");
+            eprintln!(
+                "Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)"
+            );
         }
         let before = contributions.len();
         contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
         if contributions.len() < before {
-            eprintln!("Excluded {} repo(s) via --exclude", before - contributions.len());
+            eprintln!(
+                "Excluded {} repo(s) via --exclude",
+                before - contributions.len()
+            );
         }
         for c in &mut contributions {
             let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
@@ -364,75 +537,171 @@ fn cmd_github_fetch(args: cli::GithubFetchArgs) -> anyhow::Result<()> {
     }
 
     let period = args.period.unwrap_or(Period::Month);
-    let num_fmt = if args.short { cli::NumberFormat::Short } else { args.number_format };
+    let num_fmt = if args.short {
+        cli::NumberFormat::Short
+    } else {
+        args.number_format
+    };
     let compact = !args.no_compact;
     let columns = cli::resolve_columns(&args.columns, &args.exclude_columns);
 
-    if let Err(e) = stats::aggregator::validate_groups(&args.group) {
-        anyhow::bail!(e);
-    }
+    let counts = github::api::contribution_group_cardinality(&contributions, &period);
+    let plan = stats::aggregator::resolve_group_plan(
+        &args.group,
+        &args.groups,
+        &counts,
+        stats::aggregator::GroupSource::Github,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let metadata = serde_json::json!({
+        "username": args.data.username,
+        "days": days_value,
+        "active_repos": contributions.len(),
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+    });
 
-    let group = args.group.first().copied().unwrap_or(GroupBy::Language);
-    let mut period_stats = if matches!(group, GroupBy::Repo) {
-        github::api::contributions_to_repo_stats(&contributions)
-    } else {
-        github::api::contributions_to_period_stats(&contributions, &period)
-    };
-    let mut totals = stats::aggregator::aggregate_totals(&period_stats);
-
-    if !args.exclude_lang.is_empty() {
-        stats::aggregator::filter_excluded_languages(
-            &mut period_stats,
-            &mut totals,
-            &args.exclude_lang,
-        );
-    }
-
-    match args.format {
-        FetchFormat::Json => {
-            let json = serde_json::json!({
-                "metadata": {
-                    "username": args.data.username,
-                    "days": days_value,
-                    "active_repos": contributions.len(),
-                    "generated_at": chrono::Utc::now().to_rfc3339(),
-                },
-                "user": user,
-                "periods": period_stats,
-                "totals": {
-                    "total_commits": totals.total_commits,
-                    "total_additions": totals.total_additions,
-                    "total_deletions": totals.total_deletions,
-                    "total_net_modifications": totals.total_net_modifications,
-                    "total_net_additions": totals.total_net_additions,
-                    "by_language": totals.by_language,
-                },
-                "summary": contribution_summary,
-            });
-            let content = serde_json::to_string_pretty(&json)?;
-            write_output(content, args.output.as_deref())?;
-        }
-        FetchFormat::Table => {
-            let dedup = cli::DedupMode::None;
-            let email = cli::EmailDisplay::None;
-            let identity_map = HashMap::new();
-            let content = output::table::render_stats_table(
-                &period_stats,
-                &totals,
-                &group,
-                &email,
-                &dedup,
-                &identity_map,
-                args.sort.as_ref(),
-                num_fmt,
-                &columns,
-                compact,
-                args.inline_tree,
+    if plan.hierarchical {
+        let mut period_stats = github::api::contributions_to_period_stats(&contributions, &period);
+        let mut totals = stats::aggregator::aggregate_totals(&period_stats);
+        let mut nodes =
+            github::api::contributions_to_group_tree(&contributions, &plan.levels, &period);
+        if !args.exclude_lang.is_empty() {
+            stats::aggregator::filter_excluded_languages_tree(&mut nodes, &args.exclude_lang);
+            stats::aggregator::filter_excluded_languages(
+                &mut period_stats,
+                &mut totals,
+                &args.exclude_lang,
             );
-            write_output(content, args.output.as_deref())?;
         }
-        #[cfg(feature = "tui")]
-        FetchFormat::Tui => output::tui::run_tui(&period_stats, &totals, num_fmt)?,
+
+        match args.format {
+            FetchFormat::Json => {
+                let content = output::json::render_github_group_tree_json(
+                    metadata,
+                    &user,
+                    &contribution_summary,
+                    &nodes,
+                )?;
+                write_output(content, args.output.as_deref())?;
+            }
+            FetchFormat::Table => {
+                let email = cli::EmailDisplay::None;
+                let dedup = cli::DedupMode::None;
+                let identity_map = HashMap::new();
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Tree {
+                        nodes: &nodes,
+                        levels: &plan.levels,
+                        totals: &totals,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &email,
+                        dedup: &dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                let content = output::table::render_presentation_table(&model, num_fmt, compact);
+                write_output(content, args.output.as_deref())?;
+            }
+            #[cfg(feature = "tui")]
+            FetchFormat::Tui => {
+                let email = cli::EmailDisplay::None;
+                let dedup = cli::DedupMode::None;
+                let identity_map = HashMap::new();
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Tree {
+                        nodes: &nodes,
+                        levels: &plan.levels,
+                        totals: &totals,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &email,
+                        dedup: &dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                output::tui::run_tui(&model, num_fmt, compact)?;
+            }
+        }
+    } else {
+        let group = plan.primary;
+        let mut period_stats = if matches!(group, cli::GroupBy::Repo) {
+            github::api::contributions_to_repo_stats(&contributions)
+        } else {
+            github::api::contributions_to_period_stats(&contributions, &period)
+        };
+        let mut totals = stats::aggregator::aggregate_totals(&period_stats);
+
+        if !args.exclude_lang.is_empty() {
+            stats::aggregator::filter_excluded_languages(
+                &mut period_stats,
+                &mut totals,
+                &args.exclude_lang,
+            );
+        }
+
+        match args.format {
+            FetchFormat::Json => {
+                let content = output::json::render_github_stats_json(
+                    metadata,
+                    &user,
+                    &period_stats,
+                    &totals,
+                    &contribution_summary,
+                )?;
+                write_output(content, args.output.as_deref())?;
+            }
+            FetchFormat::Table => {
+                let dedup = cli::DedupMode::None;
+                let email = cli::EmailDisplay::None;
+                let identity_map = HashMap::new();
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Flat {
+                        stats: &period_stats,
+                        totals: &totals,
+                        primary: group,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &email,
+                        dedup: &dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                let content = output::table::render_presentation_table(&model, num_fmt, compact);
+                write_output(content, args.output.as_deref())?;
+            }
+            #[cfg(feature = "tui")]
+            FetchFormat::Tui => {
+                let email = cli::EmailDisplay::None;
+                let dedup = cli::DedupMode::None;
+                let identity_map = HashMap::new();
+                let model = output::presentation::build_presentation(
+                    output::presentation::PresentationData::Flat {
+                        stats: &period_stats,
+                        totals: &totals,
+                        primary: group,
+                    },
+                    output::presentation::PresentationOptions {
+                        columns: &columns,
+                        sort: args.sort.as_ref(),
+                        email_display: &email,
+                        dedup: &dedup,
+                        identity_map: &identity_map,
+                        inline_tree: args.inline_tree,
+                    },
+                );
+                output::tui::run_tui(&model, num_fmt, compact)?;
+            }
+        }
     }
 
     Ok(())
@@ -447,56 +716,66 @@ fn cmd_github_card(args: cli::GithubCardArgs) -> anyhow::Result<()> {
         anyhow::bail!("Use either a username or --input, not both");
     }
 
-    let (user, mut totals, summary, active_repos, days_value, username) =
-        if let Some(ref input_path) = args.input {
-            load_card_data_from_json(input_path)?
-        } else {
-            let username = args
-                .username
-                .as_deref()
-                .expect("username is required when --input is not provided");
+    let (user, mut totals, summary, active_repos, days_value, username) = if let Some(
+        ref input_path,
+    ) = args.input
+    {
+        load_card_data_from_json(input_path)?
+    } else {
+        let username = args
+            .username
+            .as_deref()
+            .expect("username is required when --input is not provided");
+        let exclude_rules: Vec<exclude::ExcludeRule> = args
+            .exclude
+            .iter()
+            .map(|v| exclude::ExcludeRule::parse_many(v))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
-            let (user, mut contributions, contribution_summary, days_value) = fetch_github_data(
-                username,
-                args.days,
-                args.since.as_deref(),
-                args.until.as_deref(),
-                args.include_forks,
-                args.include_contributed,
-                args.include_private,
-                args.no_cache,
-                args.refresh_cache,
-            )?;
+        let (user, mut contributions, contribution_summary, days_value) = fetch_github_data(
+            username,
+            args.days,
+            args.since.as_deref(),
+            args.until.as_deref(),
+            args.include_forks,
+            args.include_contributed,
+            args.include_private,
+            args.no_cache,
+            args.refresh_cache,
+        )?;
 
-            let exclude_rules: Vec<exclude::ExcludeRule> = args.exclude.iter()
-                .flat_map(|v| exclude::ExcludeRule::parse_many(v))
-                .collect();
-            if !exclude_rules.is_empty() {
-                if exclude::any_path_rules(&exclude_rules) {
-                    eprintln!("Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)");
-                }
-                contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
-                for c in &mut contributions {
-                    let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
-                    for lang in langs {
-                        c.languages.retain(|l, _| !l.eq_ignore_ascii_case(&lang));
-                    }
+        if !exclude_rules.is_empty() {
+            if exclude::any_path_rules(&exclude_rules) {
+                eprintln!(
+                    "Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)"
+                );
+            }
+            contributions.retain(|c| !exclude::is_repo_excluded(&c.repo_name, &exclude_rules));
+            for c in &mut contributions {
+                let langs = exclude::excluded_langs_for_repo(&c.repo_name, &exclude_rules);
+                for lang in langs {
+                    c.languages.retain(|l, _| !l.eq_ignore_ascii_case(&lang));
                 }
             }
+        }
 
-            let active_repos = contributions.len();
-            let period_stats = github::api::contributions_to_period_stats(&contributions, &Period::Month);
-            let totals = stats::aggregator::aggregate_totals(&period_stats);
+        let active_repos = contributions.len();
+        let period_stats =
+            github::api::contributions_to_period_stats(&contributions, &Period::Month);
+        let totals = stats::aggregator::aggregate_totals(&period_stats);
 
-            (
-                user,
-                totals,
-                contribution_summary,
-                active_repos,
-                days_value,
-                username.to_string(),
-            )
-        };
+        (
+            user,
+            totals,
+            contribution_summary,
+            active_repos,
+            days_value,
+            username.to_string(),
+        )
+    };
 
     if !args.exclude_lang.is_empty() {
         stats::aggregator::remove_excluded_from_period(&mut totals, &args.exclude_lang);
@@ -613,6 +892,8 @@ fn fetch_github_data(
     github::ContributionSummary,
     u64,
 )> {
+    let now = Utc::now();
+    let time_range = resolve_time_range(days, since, until, now)?;
     let client = github::GithubClient::new()?;
     if !client.has_token() {
         anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
@@ -620,19 +901,8 @@ fn fetch_github_data(
 
     let user = client.get_user(username)?;
 
-    let since_ts = if let Some(days) = days {
-        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
-        Some((Utc::now() - duration).timestamp())
-    } else if let Some(since_str) = since {
-        Some(parse_date(since_str)?.timestamp())
-    } else {
-        None
-    };
-
-    let until_ts = until
-        .map(parse_date)
-        .transpose()?
-        .map(|date| date.timestamp());
+    let since_ts = time_range.since.map(|date| date.timestamp());
+    let until_ts = time_range.until_exclusive.map(|date| date.timestamp());
 
     let read_cache = !no_cache;
     let write_cache = refresh_cache;
@@ -652,9 +922,8 @@ fn fetch_github_data(
 
     let days_value = if let Some(days) = days {
         days.ceil() as u64
-    } else if let Some(since_str) = since {
-        let since_dt = parse_date(since_str)?;
-        let diff = Utc::now() - since_dt;
+    } else if let Some(since_dt) = time_range.since {
+        let diff = now - since_dt;
         diff.num_days().max(1) as u64
     } else {
         365
@@ -680,15 +949,43 @@ fn parse_period(s: &str) -> anyhow::Result<f64> {
             "Invalid period '{s}'. Expected: week, month, quarter, year, or Nd (e.g. 7d, 30d)"
         );
     }
-    num_str.parse::<f64>().map_err(|_| {
+    let days = num_str.parse::<f64>().map_err(|_| {
         anyhow::anyhow!(
             "Invalid period '{s}'. Expected: week, month, quarter, year, or Nd (e.g. 7d, 30d)"
         )
-    })
+    })?;
+    if !days.is_finite() || days <= 0.0 {
+        anyhow::bail!("Invalid period '{s}': numeric periods must be finite and greater than zero");
+    }
+    duration_for_days(days, "period").map_err(|e| anyhow::anyhow!("Invalid period '{s}': {e}"))?;
+    Ok(days)
 }
 
 #[cfg(feature = "github")]
 fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let periods: Vec<(f64, i64)> = args
+        .periods
+        .iter()
+        .map(|period| {
+            let days = parse_period(period)?;
+            let duration = duration_for_days(days, "period")?;
+            let since = now.checked_sub_signed(duration).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid period '{period}': range is too large for the requested duration"
+                )
+            })?;
+            Ok((days, since.timestamp()))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let exclude_rules: Vec<exclude::ExcludeRule> = args
+        .exclude
+        .iter()
+        .map(|v| exclude::ExcludeRule::parse_many(v))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let client = github::GithubClient::new()?;
     if !client.has_token() {
         anyhow::bail!("GITHUB_TOKEN environment variable is required for the github subcommand.");
@@ -698,18 +995,15 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
     let read_cache = !args.no_cache;
     let write_cache = args.refresh_cache;
 
-    let exclude_rules: Vec<exclude::ExcludeRule> = args.exclude.iter()
-        .flat_map(|v| exclude::ExcludeRule::parse_many(v))
-        .collect();
     if exclude::any_path_rules(&exclude_rules) {
-        eprintln!("Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)");
+        eprintln!(
+            "Warning: --exclude path rules are ignored in GitHub mode (no per-file data from API)"
+        );
     }
 
     let mut columns = Vec::new();
-    for period_str in &args.periods {
-        let days = parse_period(period_str)?;
-        let duration = chrono::Duration::seconds((days * 86400.0) as i64);
-        let since_ts = Some((Utc::now() - duration).timestamp());
+    for (days, since_timestamp) in periods {
+        let since_ts = Some(since_timestamp);
 
         let (mut contributions, _summary) = github::api::fetch_user_stats(
             &client,
@@ -759,4 +1053,60 @@ fn cmd_github_multi(args: cli::GithubMultiArgs) -> anyhow::Result<()> {
 
     let svg = github::render_multi_card(&columns, args.number_format, args.number_format_lines)?;
     write_output(svg, args.output.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 2, 10, 12, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn reversed_date_range_is_rejected_before_analysis() {
+        let error = resolve_time_range(None, Some("2025-02-02"), Some("2025-02-01"), fixed_now())
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--since must not be after --until")
+        );
+    }
+
+    #[test]
+    fn date_only_until_becomes_exclusive_next_midnight() {
+        let range = resolve_time_range(None, None, Some("2025-02-01"), fixed_now()).unwrap();
+
+        assert_eq!(
+            range.until_exclusive,
+            Some(Utc.with_ymd_and_hms(2025, 2, 2, 0, 0, 0).single().unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_days_are_rejected() {
+        for days in [-1.0, 0.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(
+                resolve_time_range(Some(days), None, None, fixed_now()).is_err(),
+                "expected {days:?} to be rejected"
+            );
+        }
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn invalid_numeric_periods_are_rejected() {
+        for period in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert!(
+                parse_period(period).is_err(),
+                "expected '{period}' to be rejected"
+            );
+        }
+        assert_eq!(parse_period("7d").unwrap(), 7.0);
+    }
 }

@@ -1,5 +1,6 @@
 pub mod column;
 pub mod json;
+pub mod presentation;
 pub mod table;
 
 #[cfg(feature = "tui")]

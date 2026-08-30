@@ -243,6 +243,7 @@ mod tests {
 
     fn make_commit(name: &str, email: &str) -> CommitStats {
         CommitStats {
+            repo_id: "test-id".to_string(),
             repo: "test".to_string(),
             oid: "abc123".to_string(),
             author: Author {

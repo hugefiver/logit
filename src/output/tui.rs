@@ -1,124 +1,50 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
-    DefaultTerminal, Frame,
 };
 
 use crate::cli::NumberFormat;
+use crate::output::column::{DisplayCol, build_display_cols, format_presentation_label};
+use crate::output::presentation::{PresentationModel, PresentationRow, PresentationRowKind};
 use crate::output::table::format_num;
-use crate::stats::models::PeriodStats;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
     Tree,
     Flat,
 }
 
-fn top_language(period: &PeriodStats) -> String {
-    period
-        .by_language
-        .iter()
-        .max_by_key(|(_, s)| s.additions)
-        .map(|(name, _)| name.clone())
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn sorted_languages(period: &PeriodStats) -> Vec<(&String, u64, u64)> {
-    let mut langs: Vec<_> = period
-        .by_language
-        .iter()
-        .map(|(name, ls)| (name, ls.additions, ls.deletions))
-        .collect();
-    langs.sort_by_key(|b| std::cmp::Reverse(b.1 + b.2));
-    langs
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lang_tree_row<'a>(
-    prefix: &str,
-    lang_name: &str,
-    adds: u64,
-    dels: u64,
-    dim: Style,
-    dim_green: Style,
-    dim_red: Style,
-    num_fmt: NumberFormat,
-) -> Row<'a> {
-    let net: i64 = adds as i64 - dels as i64;
-    let net_abs = format_num(net.unsigned_abs(), num_fmt);
-    let net_str = if net >= 0 {
-        format!("+{net_abs}")
-    } else {
-        format!("-{net_abs}")
-    };
-    Row::new([
-        Cell::from(Line::from(Span::styled(
-            format!("{prefix}{lang_name}"),
-            dim,
-        ))),
-        Cell::from(""),
-        Cell::from(Line::from(vec![
-            Span::styled(format!("{net_str} ("), dim),
-            Span::styled(format!("+{}", format_num(adds, num_fmt)), dim_green),
-            Span::styled(" ", dim),
-            Span::styled(format!("-{}", format_num(dels, num_fmt)), dim_red),
-            Span::styled(")", dim),
-        ])),
-        Cell::from(""),
-        Cell::from(""),
-    ])
-}
-
-fn lang_flat_row<'a>(
-    lang_name: &str,
-    adds: u64,
-    dels: u64,
-    dim: Style,
-    dim_green: Style,
-    dim_red: Style,
-    num_fmt: NumberFormat,
-) -> Row<'a> {
-    let net: i64 = adds as i64 - dels as i64;
-    let net_abs = format_num(net.unsigned_abs(), num_fmt);
-    let net_str = if net >= 0 {
-        format!("+{net_abs}")
-    } else {
-        format!("-{net_abs}")
-    };
-    Row::new([
-        Cell::from(Line::from(Span::styled(format!("  {lang_name}"), dim))),
-        Cell::from(Line::from(Span::styled(net_str, dim))),
-        Cell::from(Line::from(Span::styled(format!("+{}", format_num(adds, num_fmt)), dim_green))),
-        Cell::from(Line::from(Span::styled(format!("-{}", format_num(dels, num_fmt)), dim_red))),
-        Cell::from(""),
-    ])
-}
-
 pub struct TuiApp {
-    stats: Vec<PeriodStats>,
-    totals: PeriodStats,
+    model: PresentationModel,
     table_state: TableState,
     should_quit: bool,
     view_mode: ViewMode,
     num_fmt: NumberFormat,
+    compact: bool,
 }
 
 impl TuiApp {
-    pub fn new(stats: Vec<PeriodStats>, totals: PeriodStats, num_fmt: NumberFormat) -> Self {
+    pub fn new(model: PresentationModel, num_fmt: NumberFormat, compact: bool) -> Self {
         let mut table_state = TableState::default();
-        if !stats.is_empty() {
+        if !model.rows.is_empty() {
             table_state.select(Some(0));
         }
+        let view_mode = if model.inline_tree {
+            ViewMode::Tree
+        } else {
+            ViewMode::Flat
+        };
         Self {
-            stats,
-            totals,
+            model,
             table_state,
             should_quit: false,
-            view_mode: ViewMode::Tree,
+            view_mode,
             num_fmt,
+            compact,
         }
     }
 
@@ -137,14 +63,12 @@ impl TuiApp {
             Constraint::Length(1),
         ])
         .areas(frame.area());
-
         self.render_header(frame, header_area);
         self.render_table(frame, main_area);
         self.render_footer(frame, footer_area);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let version = env!("CARGO_PKG_VERSION");
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
                 "logit — lines of git",
@@ -152,140 +76,71 @@ impl TuiApp {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  v{version}")),
+            Span::raw(format!("  v{}", env!("CARGO_PKG_VERSION"))),
         ]));
         frame.render_widget(header, area);
     }
 
     fn render_table(&mut self, frame: &mut Frame, area: Rect) {
-        let header = Row::new([
-            Cell::from("Period"),
-            Cell::from("Commits"),
-            Cell::from("Additions"),
-            Cell::from("Deletions"),
-            Cell::from("Top Language"),
-        ])
-        .style(Style::default().bold())
-        .bottom_margin(1);
+        let display_columns = build_display_cols(&self.model.columns, self.compact);
+        let mut headers = Vec::with_capacity(display_columns.len() + 1);
+        headers.push(Cell::from(self.model.label_header.clone()));
+        headers.extend(
+            display_columns
+                .iter()
+                .map(|column| Cell::from(column.header())),
+        );
+        let header = Row::new(headers)
+            .style(Style::default().bold())
+            .bottom_margin(1);
 
-        let widths = [
-            Constraint::Min(16),
-            Constraint::Min(10),
-            Constraint::Min(12),
-            Constraint::Min(12),
-            Constraint::Fill(1),
-        ];
-
-        let green = Style::default().fg(Color::Green);
-        let red = Style::default().fg(Color::Red);
-        let dim = Style::default().fg(Color::DarkGray);
-        let dim_green = Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::DIM);
-        let dim_red = Style::default().fg(Color::Red).add_modifier(Modifier::DIM);
-
-        let mut all_rows: Vec<Row> = Vec::new();
-
-        for p in &self.stats {
-            all_rows.push(Row::new([
-                Cell::from(p.period_label.clone()),
-                Cell::from(format_num(p.total_commits, self.num_fmt)),
-                Cell::from(Line::from(Span::styled(
-                    format!("+{}", format_num(p.total_additions, self.num_fmt)),
-                    green,
-                ))),
-                Cell::from(Line::from(Span::styled(
-                    format!("-{}", format_num(p.total_deletions, self.num_fmt)),
-                    red,
-                ))),
-                Cell::from(top_language(p)),
-            ]));
-
-            let langs = sorted_languages(p);
-            for (i, (lang_name, adds, dels)) in langs.iter().enumerate() {
-                all_rows.push(match self.view_mode {
-                    ViewMode::Tree => {
-                        let prefix = if i == langs.len() - 1 {
-                            "└── "
-                        } else {
-                            "├── "
-                        };
-                        lang_tree_row(prefix, lang_name, *adds, *dels, dim, dim_green, dim_red, self.num_fmt)
-                    }
-                    ViewMode::Flat => {
-                        lang_flat_row(lang_name, *adds, *dels, dim, dim_green, dim_red, self.num_fmt)
-                    }
-                });
-            }
-        }
-
-        all_rows.push(
-            Row::new([
-                Cell::from("───"),
-                Cell::from("───"),
-                Cell::from("───"),
-                Cell::from("───"),
-                Cell::from("───"),
-            ])
-            .style(Style::default().fg(Color::DarkGray)),
+        let mut widths = Vec::with_capacity(display_columns.len() + 1);
+        widths.push(Constraint::Min(self.model.label_header.len().max(16) as u16));
+        widths.extend(
+            display_columns
+                .iter()
+                .map(|column| Constraint::Length((column.header().len().max(8) + 1) as u16)),
         );
 
-        let totals_bold = Style::default().bold();
-        all_rows.push(Row::new([
-            Cell::from(Line::from(Span::styled("Total", totals_bold))),
-            Cell::from(Line::from(Span::styled(
-                format_num(self.totals.total_commits, self.num_fmt),
-                totals_bold,
-            ))),
-            Cell::from(Line::from(Span::styled(
-                format!("+{}", format_num(self.totals.total_additions, self.num_fmt)),
-                green.add_modifier(Modifier::BOLD),
-            ))),
-            Cell::from(Line::from(Span::styled(
-                format!("-{}", format_num(self.totals.total_deletions, self.num_fmt)),
-                red.add_modifier(Modifier::BOLD),
-            ))),
-            Cell::from(Line::from(Span::styled(
-                top_language(&self.totals),
-                totals_bold,
-            ))),
-        ]));
-
-        let total_langs = sorted_languages(&self.totals);
-        for (i, (lang_name, adds, dels)) in total_langs.iter().enumerate() {
-            all_rows.push(match self.view_mode {
-                ViewMode::Tree => {
-                    let prefix = if i == total_langs.len() - 1 {
-                        "└── "
-                    } else {
-                        "├── "
-                    };
-                    lang_tree_row(prefix, lang_name, *adds, *dels, dim, dim_green, dim_red, self.num_fmt)
-                }
-                ViewMode::Flat => lang_flat_row(lang_name, *adds, *dels, dim, dim_green, dim_red, self.num_fmt),
-            });
-        }
-
-        let highlight_style = Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD);
+        let mut rows: Vec<Row> = self
+            .model
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                presentation_row(
+                    row,
+                    presentation_label(&self.model, index, row, self.view_mode, self.num_fmt),
+                    &display_columns,
+                    self.num_fmt,
+                )
+            })
+            .collect();
+        rows.push(presentation_row(
+            &self.model.total,
+            format_presentation_label(&self.model.total, &self.model.columns, self.num_fmt),
+            &display_columns,
+            self.num_fmt,
+        ));
 
         let title = match self.view_mode {
             ViewMode::Tree => "Stats [tree]",
             ViewMode::Flat => "Stats [flat]",
         };
-
-        let table = Table::new(all_rows, widths)
+        let table = Table::new(rows, widths)
             .header(header)
             .block(Block::default().borders(Borders::ALL).title(title))
-            .row_highlight_style(highlight_style)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol(">> ");
-
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let mode_label = match self.view_mode {
+        let next_mode = match self.view_mode {
             ViewMode::Tree => "flat",
             ViewMode::Flat => "tree",
         };
@@ -293,7 +148,7 @@ impl TuiApp {
             Span::styled("↑↓", Style::default().bold()),
             Span::raw(": Navigate | "),
             Span::styled("t", Style::default().bold()),
-            Span::raw(format!(": Switch to {mode_label} | ")),
+            Span::raw(format!(": Switch to {next_mode} | ")),
             Span::styled("q", Style::default().bold()),
             Span::raw(": Quit"),
         ]))
@@ -329,10 +184,10 @@ impl TuiApp {
         if total == 0 {
             return;
         }
-        let next = match self.table_state.selected() {
-            Some(i) => (i + 1) % total,
-            None => 0,
-        };
+        let next = self
+            .table_state
+            .selected()
+            .map_or(0, |index| (index + 1) % total);
         self.table_state.select(Some(next));
     }
 
@@ -341,26 +196,98 @@ impl TuiApp {
         if total == 0 {
             return;
         }
-        let prev = match self.table_state.selected() {
-            Some(0) => total - 1,
-            Some(i) => i - 1,
-            None => total - 1,
+        let previous = match self.table_state.selected() {
+            Some(0) | None => total - 1,
+            Some(index) => index - 1,
         };
-        self.table_state.select(Some(prev));
+        self.table_state.select(Some(previous));
     }
 
     fn row_count(&self) -> usize {
-        if self.stats.is_empty() {
-            return 0;
+        if self.model.rows.is_empty() {
+            0
+        } else {
+            self.model.rows.len() + 1
         }
-        let data_rows: usize = self.stats.iter().map(|p| 1 + p.by_language.len()).sum();
-        data_rows + 2 + self.totals.by_language.len()
     }
 }
 
-pub fn run_tui(stats: &[PeriodStats], totals: &PeriodStats, num_fmt: NumberFormat) -> anyhow::Result<()> {
+fn presentation_row<'a>(
+    row: &PresentationRow,
+    label: String,
+    columns: &[DisplayCol],
+    num_fmt: NumberFormat,
+) -> Row<'a> {
+    let base_style = match row.kind {
+        PresentationRowKind::Group => Style::default(),
+        PresentationRowKind::Language => Style::default().fg(Color::DarkGray),
+        PresentationRowKind::Total => Style::default().add_modifier(Modifier::BOLD),
+    };
+    let mut cells = Vec::with_capacity(columns.len() + 1);
+    cells.push(Cell::from(label));
+    cells.extend(
+        columns
+            .iter()
+            .map(|column| metric_cell(*column, row, num_fmt)),
+    );
+    Row::new(cells).style(base_style)
+}
+
+fn metric_cell<'a>(column: DisplayCol, row: &PresentationRow, num_fmt: NumberFormat) -> Cell<'a> {
+    let metrics = row.metrics;
+    match column {
+        DisplayCol::Commits => Cell::from(format_num(metrics.commits, num_fmt)),
+        DisplayCol::Adds => Cell::from(format_num(metrics.additions, num_fmt))
+            .style(Style::default().fg(Color::Green)),
+        DisplayCol::Dels => Cell::from(format_num(metrics.deletions, num_fmt))
+            .style(Style::default().fg(Color::Red)),
+        DisplayCol::Changes => Cell::from(format!(
+            "+{} -{}",
+            format_num(metrics.additions, num_fmt),
+            format_num(metrics.deletions, num_fmt)
+        )),
+        DisplayCol::Net => {
+            let net = metrics.net();
+            let sign = if net >= 0 { '+' } else { '-' };
+            let color = if net >= 0 { Color::Green } else { Color::Red };
+            Cell::from(format!("{sign}{}", format_num(net.unsigned_abs(), num_fmt)))
+                .style(Style::default().fg(color))
+        }
+        DisplayCol::Files => {
+            Cell::from(format_num(metrics.files, num_fmt)).style(Style::default().fg(Color::Yellow))
+        }
+    }
+}
+
+fn presentation_label(
+    model: &PresentationModel,
+    index: usize,
+    row: &PresentationRow,
+    view_mode: ViewMode,
+    num_fmt: NumberFormat,
+) -> String {
+    let label = format_presentation_label(row, &model.columns, num_fmt);
+    if row.depth == 0 {
+        return label;
+    }
+    if view_mode == ViewMode::Flat {
+        return format!("{}{label}", "  ".repeat(row.depth));
+    }
+    let next_boundary = model.rows[index + 1..]
+        .iter()
+        .find(|next| next.depth <= row.depth);
+    let is_last = next_boundary.is_none_or(|next| next.depth < row.depth);
+    let branch = if is_last { "└── " } else { "├── " };
+    format!("{}{branch}{label}", "    ".repeat(row.depth - 1))
+}
+
+pub fn run_tui(
+    model: &PresentationModel,
+    num_fmt: NumberFormat,
+    compact: bool,
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let mut app = TuiApp::new(stats.to_vec(), totals.clone(), num_fmt);
+    let mut app = TuiApp::new(model.clone(), num_fmt, compact);
     let result = app.run(&mut terminal);
     ratatui::restore();
     result
@@ -368,95 +295,80 @@ pub fn run_tui(stats: &[PeriodStats], totals: &PeriodStats, num_fmt: NumberForma
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
     use super::*;
-    use std::collections::HashMap;
+    use crate::cli::Column;
+    use crate::output::presentation::{PresentationMetrics, PresentationRow};
 
-    use crate::stats::models::LangStats;
-
-    fn make_period(label: &str, commits: u64, adds: u64, dels: u64) -> PeriodStats {
-        let mut by_language = HashMap::new();
-        if adds > 0 || dels > 0 {
-            by_language.insert(
-                "Rust".to_string(),
-                LangStats {
-                    additions: adds,
-                    deletions: dels,
-                    files_changed: 1,
-                    ..Default::default()
+    fn sample_model() -> PresentationModel {
+        PresentationModel {
+            label_header: "Period / Language".to_string(),
+            columns: Column::default_set(),
+            rows: vec![
+                PresentationRow {
+                    depth: 0,
+                    label: "2025-W01".to_string(),
+                    kind: PresentationRowKind::Group,
+                    metrics: PresentationMetrics {
+                        commits: 5,
+                        additions: 100,
+                        deletions: 20,
+                        files: 2,
+                    },
                 },
-            );
-        }
-        PeriodStats {
-            period_label: label.to_string(),
-            by_language,
-            by_author: HashMap::new(),
-            total_commits: commits,
-            total_additions: adds,
-            total_deletions: dels,
-            total_net_modifications: adds.max(dels),
-            total_net_additions: adds.saturating_sub(dels),
-        }
-    }
-
-    fn make_multi_lang_period(label: &str) -> PeriodStats {
-        let mut by_language = HashMap::new();
-        by_language.insert(
-            "Go".to_string(),
-            LangStats {
-                additions: 200,
-                deletions: 50,
-                files_changed: 5,
-                net_modifications: 200,
-                net_additions: 150,
+                PresentationRow {
+                    depth: 1,
+                    label: "Rust".to_string(),
+                    kind: PresentationRowKind::Language,
+                    metrics: PresentationMetrics {
+                        additions: 100,
+                        deletions: 20,
+                        files: 2,
+                        ..Default::default()
+                    },
+                },
+            ],
+            total: PresentationRow {
+                depth: 0,
+                label: "Total".to_string(),
+                kind: PresentationRowKind::Total,
+                metrics: PresentationMetrics {
+                    commits: 5,
+                    additions: 100,
+                    deletions: 20,
+                    files: 2,
+                },
             },
-        );
-        by_language.insert(
-            "Python".to_string(),
-            LangStats {
-                additions: 100,
-                deletions: 30,
-                files_changed: 3,
-                net_modifications: 100,
-                net_additions: 70,
-            },
-        );
-        PeriodStats {
-            period_label: label.to_string(),
-            by_language,
-            by_author: HashMap::new(),
-            total_commits: 10,
-            total_additions: 300,
-            total_deletions: 80,
-            total_net_modifications: 300,
-            total_net_additions: 220,
+            inline_tree: true,
         }
     }
 
-    fn make_totals() -> PeriodStats {
-        make_period("Total", 15, 250, 40)
-    }
-
-    fn sample_stats() -> Vec<PeriodStats> {
-        vec![
-            make_period("2025-W01", 5, 100, 20),
-            make_period("2025-W02", 10, 150, 20),
-        ]
+    fn render_to_text(app: &mut TuiApp) -> anyhow::Result<String> {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| app.render(frame))?;
+        let buffer = terminal.backend().buffer();
+        Ok(buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>())
     }
 
     #[test]
     fn should_quit_defaults_to_false() {
-        let app = TuiApp::new(sample_stats(), make_totals(), NumberFormat::Separated);
+        let app = TuiApp::new(sample_model(), NumberFormat::Separated, true);
         assert!(!app.should_quit);
     }
 
     #[test]
     fn next_row_wraps_at_end() {
-        let mut app = TuiApp::new(sample_stats(), make_totals(), NumberFormat::Separated);
+        let mut app = TuiApp::new(sample_model(), NumberFormat::Separated, true);
         let total = app.row_count();
-        assert_eq!(app.table_state.selected(), Some(0));
-        for i in 1..total {
+        for expected in 1..total {
             app.next_row();
-            assert_eq!(app.table_state.selected(), Some(i));
+            assert_eq!(app.table_state.selected(), Some(expected));
         }
         app.next_row();
         assert_eq!(app.table_state.selected(), Some(0));
@@ -464,105 +376,150 @@ mod tests {
 
     #[test]
     fn prev_row_wraps_at_beginning() {
-        let mut app = TuiApp::new(sample_stats(), make_totals(), NumberFormat::Separated);
-        let total = app.row_count();
-        assert_eq!(app.table_state.selected(), Some(0));
+        let mut app = TuiApp::new(sample_model(), NumberFormat::Separated, true);
         app.prev_row();
-        assert_eq!(app.table_state.selected(), Some(total - 1));
+        assert_eq!(app.table_state.selected(), Some(app.row_count() - 1));
     }
 
     #[test]
     fn navigation_on_empty_stats_does_not_panic() {
-        let totals = make_period("Total", 0, 0, 0);
-        let mut app = TuiApp::new(vec![], totals, NumberFormat::Separated);
-        assert_eq!(app.table_state.selected(), None);
+        let mut model = sample_model();
+        model.rows.clear();
+        let mut app = TuiApp::new(model, NumberFormat::Separated, true);
         app.next_row();
         app.prev_row();
         assert_eq!(app.table_state.selected(), None);
     }
 
     #[test]
-    fn top_language_returns_highest_additions() {
-        let mut by_language = HashMap::new();
-        by_language.insert(
-            "Rust".to_string(),
-            LangStats {
-                additions: 200,
-                deletions: 10,
-                files_changed: 3,
-                net_modifications: 200,
-                net_additions: 190,
-            },
-        );
-        by_language.insert(
-            "Python".to_string(),
-            LangStats {
-                additions: 50,
-                deletions: 5,
-                files_changed: 1,
-                net_modifications: 50,
-                net_additions: 45,
-            },
-        );
-        let period = PeriodStats {
-            period_label: "test".to_string(),
-            by_language,
-            by_author: HashMap::new(),
-            total_commits: 5,
-            total_additions: 250,
-            total_deletions: 15,
-            total_net_modifications: 250,
-            total_net_additions: 235,
-        };
-        assert_eq!(top_language(&period), "Rust");
-    }
-
-    #[test]
-    fn top_language_empty_returns_dash() {
-        let period = PeriodStats {
-            period_label: "test".to_string(),
-            by_language: HashMap::new(),
-            by_author: HashMap::new(),
-            total_commits: 0,
-            total_additions: 0,
-            total_deletions: 0,
-            total_net_modifications: 0,
-            total_net_additions: 0,
-        };
-        assert_eq!(top_language(&period), "—");
-    }
-
-    #[test]
     fn row_count_includes_language_rows() {
-        let stats = vec![make_multi_lang_period("2025-W01")];
-        let totals = make_totals();
-        let app = TuiApp::new(stats, totals, NumberFormat::Separated);
-        assert_eq!(app.row_count(), 6);
+        let app = TuiApp::new(sample_model(), NumberFormat::Separated, true);
+        assert_eq!(app.row_count(), app.model.rows.len() + 1);
     }
 
     #[test]
     fn row_count_empty_is_zero() {
-        let totals = make_period("Total", 0, 0, 0);
-        let app = TuiApp::new(vec![], totals, NumberFormat::Separated);
+        let mut model = sample_model();
+        model.rows.clear();
+        let app = TuiApp::new(model, NumberFormat::Separated, true);
         assert_eq!(app.row_count(), 0);
     }
 
     #[test]
-    fn sorted_languages_returns_by_total_desc() {
-        let period = make_multi_lang_period("test");
-        let langs = sorted_languages(&period);
-        assert_eq!(langs.len(), 2);
-        assert_eq!(langs[0].0, "Go");
-        assert_eq!(langs[1].0, "Python");
-    }
-
-    #[test]
     fn toggle_view_switches_mode() {
-        let mut app = TuiApp::new(sample_stats(), make_totals(), NumberFormat::Separated);
+        let mut app = TuiApp::new(sample_model(), NumberFormat::Separated, true);
         assert_eq!(app.view_mode, ViewMode::Tree);
         app.toggle_view();
         assert_eq!(app.view_mode, ViewMode::Flat);
         app.toggle_view();
         assert_eq!(app.view_mode, ViewMode::Tree);
+    }
+
+    #[test]
+    fn tui_multigroup_is_nonempty_and_successful() {
+        let mut model = sample_model();
+        model.label_header = "Repo / Author / Language".to_string();
+        model.rows.insert(
+            1,
+            PresentationRow {
+                depth: 1,
+                label: "Alice".to_string(),
+                kind: PresentationRowKind::Group,
+                metrics: model.rows[0].metrics,
+            },
+        );
+        model.rows[0].label = "repo-a".to_string();
+        model.rows[2].depth = 2;
+        let mut app = TuiApp::new(model, NumberFormat::Plain, false);
+        let output = render_to_text(&mut app).expect("render multi-group TUI");
+        assert!(app.row_count() > 1);
+        assert!(output.contains("repo-a"));
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Rust"));
+    }
+
+    #[test]
+    fn tui_has_no_fixed_period_or_five_metric_assumption() {
+        let mut model = sample_model();
+        model.label_header = "Repository".to_string();
+        model.columns = vec![Column::Files, Column::Net];
+        model.rows[0].label = "repo-a".to_string();
+        let mut app = TuiApp::new(model, NumberFormat::Plain, false);
+        let output = render_to_text(&mut app).expect("render selected TUI columns");
+        assert!(output.contains("Repository"));
+        assert!(output.contains("Files"));
+        assert!(output.contains("Net"));
+        assert!(!output.contains("Period"));
+        assert!(!output.contains("Commits"));
+        assert!(!output.contains("Additions"));
+    }
+
+    #[test]
+    fn table_and_tui_testbackend_show_same_semantic_rows() {
+        let model = PresentationModel {
+            label_header: "Repo / Author / Language".to_string(),
+            columns: vec![Column::Files, Column::Commits, Column::Net],
+            rows: vec![
+                PresentationRow {
+                    depth: 0,
+                    label: "repo-a".to_string(),
+                    kind: PresentationRowKind::Group,
+                    metrics: PresentationMetrics {
+                        commits: 2,
+                        additions: 9,
+                        deletions: 2,
+                        files: 1,
+                    },
+                },
+                PresentationRow {
+                    depth: 1,
+                    label: "Alice".to_string(),
+                    kind: PresentationRowKind::Group,
+                    metrics: PresentationMetrics {
+                        commits: 2,
+                        additions: 9,
+                        deletions: 2,
+                        files: 1,
+                    },
+                },
+                PresentationRow {
+                    depth: 2,
+                    label: "Rust".to_string(),
+                    kind: PresentationRowKind::Language,
+                    metrics: PresentationMetrics {
+                        additions: 9,
+                        deletions: 2,
+                        files: 1,
+                        ..Default::default()
+                    },
+                },
+            ],
+            total: PresentationRow {
+                depth: 0,
+                label: "Total".to_string(),
+                kind: PresentationRowKind::Total,
+                metrics: PresentationMetrics {
+                    commits: 2,
+                    additions: 9,
+                    deletions: 2,
+                    files: 1,
+                },
+            },
+            inline_tree: true,
+        };
+        colored::control::set_override(false);
+        let table =
+            crate::output::table::render_presentation_table(&model, NumberFormat::Plain, false);
+        let mut app = TuiApp::new(model, NumberFormat::Plain, false);
+        let tui = render_to_text(&mut app).expect("render TUI test backend");
+        for semantic in [
+            "repo-a", "Alice", "Rust", "Files", "Commits", "Net", "Total",
+        ] {
+            assert!(
+                table.contains(semantic),
+                "table missing {semantic}: {table}"
+            );
+            assert!(tui.contains(semantic), "TUI missing {semantic}: {tui}");
+        }
     }
 }

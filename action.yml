@@ -100,52 +100,111 @@ runs:
     - name: Generate SVG
       shell: bash
       env:
+        INPUT_USERNAME: ${{ inputs.username }}
         GITHUB_TOKEN: ${{ inputs.token }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_DAYS: ${{ inputs.days }}
+        INPUT_PERIODS: ${{ inputs.periods }}
+        INPUT_INCLUDE_FORKS: ${{ inputs.include-forks }}
+        INPUT_INCLUDE_CONTRIBUTED: ${{ inputs.include-contributed }}
+        INPUT_INCLUDE_PRIVATE: ${{ inputs.include-private }}
+        INPUT_EXCLUDE_LANG: ${{ inputs.exclude-lang }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_SHORT: ${{ inputs.short }}
+        INPUT_LANG_ROWS: ${{ inputs.lang-rows }}
+        INPUT_TITLE: ${{ inputs.title }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_RETRY_COUNT: ${{ inputs.retry-count }}
+        INPUT_RETRY_DELAY: ${{ inputs.retry-delay }}
       run: |
-        CMD="logit github ${{ inputs.command }}"
+        set -euo pipefail
 
-        if [ "${{ inputs.command }}" = "multi" ]; then
-          CMD="$CMD ${{ inputs.username }} -p ${{ inputs.periods }}"
+        invalid_input() {
+          echo "Invalid input: $1" >&2
+          exit 2
+        }
+
+        is_nonnegative_decimal() {
+          [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+        }
+
+        is_positive_decimal() {
+          is_nonnegative_decimal "$1" || return 1
+          local digits="${1//./}"
+          [[ "$digits" =~ [1-9] ]]
+        }
+
+        case "$INPUT_COMMAND" in
+          card|multi) ;;
+          *) invalid_input command ;;
+        esac
+
+        for boolean in "$INPUT_INCLUDE_FORKS" "$INPUT_INCLUDE_CONTRIBUTED" "$INPUT_INCLUDE_PRIVATE" "$INPUT_SHORT"; do
+          case "$boolean" in
+            true|false) ;;
+            *) invalid_input boolean ;;
+          esac
+        done
+
+        [[ "$INPUT_RETRY_COUNT" =~ ^[0-9]+$ ]] || invalid_input retry-count
+        is_nonnegative_decimal "$INPUT_RETRY_DELAY" || invalid_input retry-delay
+        is_positive_decimal "$INPUT_DAYS" || invalid_input days
+        [[ "$INPUT_LANG_ROWS" =~ ^[0-9]+$ ]] || invalid_input lang-rows
+
+        if [ "$INPUT_COMMAND" = "multi" ]; then
+          [[ -n "$INPUT_PERIODS" && "$INPUT_PERIODS" != ,* && "$INPUT_PERIODS" != *, && "$INPUT_PERIODS" != *,,* ]] || invalid_input periods
+          IFS=',' read -r -a periods <<< "$INPUT_PERIODS"
+          for period in "${periods[@]}"; do
+            case "$period" in
+              week|month|quarter|half|year) ;;
+              *)
+                period_days="${period%[dD]}"
+                is_positive_decimal "$period_days" || invalid_input periods
+                ;;
+            esac
+          done
+        fi
+
+        cmd=(logit github "$INPUT_COMMAND" "$INPUT_USERNAME")
+        if [ "$INPUT_COMMAND" = "multi" ]; then
+          cmd+=(-p "$INPUT_PERIODS")
         else
-          CMD="$CMD ${{ inputs.username }} -d ${{ inputs.days }}"
-          if [ "${{ inputs.short }}" = "true" ]; then CMD="$CMD --short"; fi
-          if [ -n "${{ inputs.lang-rows }}" ]; then CMD="$CMD --lang-rows ${{ inputs.lang-rows }}"; fi
-          if [ -n "${{ inputs.title }}" ]; then CMD="$CMD --title '${{ inputs.title }}'"; fi
+          cmd+=(-d "$INPUT_DAYS")
+          if [ "$INPUT_SHORT" = "true" ]; then cmd+=(--short); fi
+          cmd+=(--lang-rows "$INPUT_LANG_ROWS")
+          if [ -n "$INPUT_TITLE" ]; then cmd+=(--title "$INPUT_TITLE"); fi
         fi
 
-        if [ "${{ inputs.include-forks }}" = "true" ]; then CMD="$CMD --include-forks"; fi
-        if [ "${{ inputs.include-contributed }}" = "true" ]; then CMD="$CMD --include-contributed"; fi
-        if [ "${{ inputs.include-private }}" = "true" ]; then CMD="$CMD --include-private"; fi
-        if [ -n "${{ inputs.exclude-lang }}" ]; then CMD="$CMD --exclude-lang ${{ inputs.exclude-lang }}"; fi
-        if [ -n "${{ inputs.exclude }}" ]; then
-          while IFS= read -r line; do
-            line="$(echo "$line" | xargs)"
-            if [ -n "$line" ]; then CMD="$CMD --exclude $line"; fi
-          done <<< "${{ inputs.exclude }}"
+        if [ "$INPUT_INCLUDE_FORKS" = "true" ]; then cmd+=(--include-forks); fi
+        if [ "$INPUT_INCLUDE_CONTRIBUTED" = "true" ]; then cmd+=(--include-contributed); fi
+        if [ "$INPUT_INCLUDE_PRIVATE" = "true" ]; then cmd+=(--include-private); fi
+        if [ -n "$INPUT_EXCLUDE_LANG" ]; then cmd+=(--exclude-lang "$INPUT_EXCLUDE_LANG"); fi
+        if [ -n "$INPUT_EXCLUDE" ]; then
+          while IFS= read -r line || [ -n "$line" ]; do
+            if [ -n "$line" ]; then cmd+=(--exclude "$line"); fi
+          done <<< "$INPUT_EXCLUDE"
         fi
+        cmd+=(-o "$INPUT_OUTPUT")
 
-        CMD="$CMD -o ${{ inputs.output }}"
-        echo "Running: $CMD"
+        attempt=1
+        while :; do
+          echo "::group::Attempt $attempt"
+          set +e
+          "${cmd[@]}"
+          exit_code=$?
+          set -e
+          echo "::endgroup::"
 
-        MAX_RETRIES=${{ inputs.retry-count }}
-        RETRY_DELAY=${{ inputs.retry-delay }}
-        ATTEMPT=1
-
-        while [ $ATTEMPT -le $MAX_RETRIES ]; do
-          echo "::group::Attempt $ATTEMPT/$MAX_RETRIES"
-          if eval $CMD; then
-            echo "::endgroup::"
-            echo "Succeeded on attempt $ATTEMPT"
+          if [ "$exit_code" -eq 0 ]; then
+            echo "Succeeded on attempt $attempt"
             exit 0
           fi
-          EXIT_CODE=$?
-          echo "::endgroup::"
-          if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-            echo "Attempt $ATTEMPT failed with exit code $EXIT_CODE. Retrying in ${RETRY_DELAY}s..."
-            sleep $RETRY_DELAY
-          else
-            echo "All $MAX_RETRIES attempts failed. Last exit code: $EXIT_CODE"
-            exit $EXIT_CODE
+          if [ "$attempt" -gt "$INPUT_RETRY_COUNT" ]; then
+            echo "All attempts failed. Last exit code: $exit_code"
+            exit "$exit_code"
           fi
-          ATTEMPT=$((ATTEMPT + 1))
+
+          echo "Attempt $attempt failed with exit code $exit_code. Retrying in ${INPUT_RETRY_DELAY}s..."
+          sleep "$INPUT_RETRY_DELAY"
+          attempt=$((attempt + 1))
         done

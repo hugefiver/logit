@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -9,6 +10,178 @@ use crate::git::repo::RepoAnalyzer;
 use crate::lang::apply_language_to_changes;
 use crate::stats::models::CommitStats;
 
+#[derive(Debug, Clone)]
+pub struct RepoInput {
+    pub path: PathBuf,
+    pub id: String,
+    pub label: String,
+}
+
+/// Canonicalize, deduplicate, label, and optionally select repository inputs.
+pub fn normalize_repo_inputs(
+    paths: Vec<PathBuf>,
+    selectors: Option<&[String]>,
+) -> anyhow::Result<Vec<RepoInput>> {
+    let mut repos: Vec<RepoInput> = paths
+        .into_iter()
+        .map(|path| {
+            let path = normalize_repo_path(&path);
+            let id = repo_id_for_path(&path);
+            RepoInput {
+                path,
+                id,
+                label: String::new(),
+            }
+        })
+        .collect();
+
+    repos.sort_by(|left, right| {
+        repo_identity_key(&left.id)
+            .cmp(&repo_identity_key(&right.id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    repos.dedup_by(|left, right| repo_ids_equal(&left.id, &right.id));
+    assign_repo_labels(&mut repos);
+
+    let Some(selectors) = selectors else {
+        return Ok(repos);
+    };
+
+    let mut selected_ids = HashSet::new();
+    for selector in selectors {
+        let normalized_selector = selector.replace('\\', "/");
+        if let Some(repo) = repos.iter().find(|repo| {
+            repo.label == normalized_selector || repo_ids_equal(&repo.id, &normalized_selector)
+        }) {
+            selected_ids.insert(repo_identity_key(&repo.id));
+            continue;
+        }
+
+        if !normalized_selector.contains('/') {
+            let matches: Vec<&RepoInput> = repos
+                .iter()
+                .filter(|repo| repo_basename(&repo.id) == normalized_selector)
+                .collect();
+            match matches.as_slice() {
+                [repo] => {
+                    selected_ids.insert(repo_identity_key(&repo.id));
+                    continue;
+                }
+                [] => {}
+                _ => {
+                    let labels = matches
+                        .iter()
+                        .map(|repo| repo.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    anyhow::bail!(
+                        "repository selector '{selector}' is ambiguous; use one of: {labels}"
+                    );
+                }
+            }
+        }
+
+        let labels = repos
+            .iter()
+            .map(|repo| repo.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("repository selector '{selector}' did not match; available: {labels}");
+    }
+
+    Ok(repos
+        .into_iter()
+        .filter(|repo| selected_ids.contains(&repo_identity_key(&repo.id)))
+        .collect())
+}
+
+fn normalize_repo_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() {
+                        normalized.push(component.as_os_str());
+                    }
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        if normalized.as_os_str().is_empty() {
+            path.to_path_buf()
+        } else {
+            normalized
+        }
+    })
+}
+
+fn repo_id_for_path(path: &Path) -> String {
+    let id = path.to_string_lossy().replace('\\', "/");
+    if id.is_empty() { ".".to_string() } else { id }
+}
+
+fn repo_identity_key(id: &str) -> String {
+    if cfg!(windows) {
+        id.to_lowercase()
+    } else {
+        id.to_string()
+    }
+}
+
+fn repo_ids_equal(left: &str, right: &str) -> bool {
+    repo_identity_key(left) == repo_identity_key(right)
+}
+
+fn repo_basename(id: &str) -> &str {
+    id.rsplit('/')
+        .find(|component| !component.is_empty())
+        .unwrap_or(id)
+}
+
+fn suffix_label(id: &str, depth: usize) -> String {
+    let components: Vec<&str> = id
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if depth >= components.len() {
+        return id.to_string();
+    }
+    let start = components.len().saturating_sub(depth);
+    components[start..].join("/")
+}
+
+fn assign_repo_labels(repos: &mut [RepoInput]) {
+    for index in 0..repos.len() {
+        let basename = repo_basename(&repos[index].id);
+        let matching_basenames = repos
+            .iter()
+            .filter(|repo| repo_basename(&repo.id) == basename)
+            .count();
+
+        if matching_basenames == 1 {
+            repos[index].label = basename.to_string();
+            continue;
+        }
+
+        let mut depth = 2;
+        loop {
+            let label = suffix_label(&repos[index].id, depth);
+            let collides = repos.iter().enumerate().any(|(other_index, repo)| {
+                other_index != index
+                    && repo_basename(&repo.id) == basename
+                    && suffix_label(&repo.id, depth) == label
+            });
+            if !collides {
+                repos[index].label = label;
+                break;
+            }
+            depth += 1;
+        }
+    }
+}
+
 /// Error from analyzing a single repository.
 pub struct RepoError {
     pub path: PathBuf,
@@ -19,15 +192,15 @@ pub struct RepoError {
 ///
 /// Returns `(all_commits, repo_errors)`.
 /// Each rayon task opens its own `Repository` — `git2::Repository` is not `Send`,
-/// so we pass only `PathBuf` into the parallel iterator.
+/// so the parallel iterator receives only `RepoInput` values, not repository handles.
 pub fn analyze_repos(
-    paths: &[PathBuf],
+    repos: &[RepoInput],
     since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    until_exclusive: Option<DateTime<Utc>>,
 ) -> (Vec<CommitStats>, Vec<RepoError>) {
-    let results: Vec<Result<Vec<CommitStats>, RepoError>> = paths
+    let results: Vec<Result<Vec<CommitStats>, RepoError>> = repos
         .par_iter()
-        .map(|path| analyze_single_repo(path, since, until))
+        .map(|repo| analyze_single_repo(repo, since, until_exclusive))
         .collect();
 
     let mut all_commits = Vec::new();
@@ -36,10 +209,7 @@ pub fn analyze_repos(
     for result in results {
         match result {
             Ok(commits) => all_commits.extend(commits),
-            Err(e) => {
-                eprintln!("Error analyzing repo {}: {}", e.path.display(), e.error);
-                errors.push(e);
-            }
+            Err(e) => errors.push(e),
         }
     }
 
@@ -48,33 +218,34 @@ pub fn analyze_repos(
 
 /// Analyze a single repository. Opens its own `Repository` handle.
 fn analyze_single_repo(
-    path: &Path,
+    input: &RepoInput,
     since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+    until_exclusive: Option<DateTime<Utc>>,
 ) -> Result<Vec<CommitStats>, RepoError> {
-    let analyzer = RepoAnalyzer::open(path).map_err(|e| RepoError {
-        path: path.to_path_buf(),
+    let analyzer = RepoAnalyzer::open(&input.path).map_err(|e| RepoError {
+        path: input.path.clone(),
         error: format!("{e:#}"),
     })?;
 
-    let commit_infos = analyzer.walk_commits(since, until).map_err(|e| RepoError {
-        path: path.to_path_buf(),
-        error: format!("{e:#}"),
-    })?;
+    let commit_infos = analyzer
+        .walk_commits(since, until_exclusive)
+        .map_err(|e| RepoError {
+            path: input.path.clone(),
+            error: format!("{e:#}"),
+        })?;
 
     let repo = analyzer.repo();
-    let repo_name = analyzer.repo_name().to_string();
 
     let mut stats = Vec::with_capacity(commit_infos.len());
 
     for ci in &commit_infos {
         let commit = repo.find_commit(ci.oid).map_err(|e| RepoError {
-            path: path.to_path_buf(),
+            path: input.path.clone(),
             error: format!("Failed to find commit {}: {e:#}", ci.oid),
         })?;
 
         let mut file_changes = analyze_commit_diff(repo, &commit).map_err(|e| RepoError {
-            path: path.to_path_buf(),
+            path: input.path.clone(),
             error: format!("Failed to analyze diff for {}: {e:#}", ci.oid),
         })?;
 
@@ -84,7 +255,8 @@ fn analyze_single_repo(
         let message_subject = ci.message.lines().next().unwrap_or("").to_string();
 
         stats.push(CommitStats {
-            repo: repo_name.clone(),
+            repo_id: input.id.clone(),
+            repo: input.label.clone(),
             oid: format!("{}", ci.oid),
             author: ci.author.clone(),
             committer: ci.committer.clone(),
@@ -103,6 +275,9 @@ mod tests {
     use super::*;
     use git2::{Repository, Signature, Time};
     use tempfile::TempDir;
+
+    use crate::cli::Period;
+    use crate::stats::aggregator::aggregate_commits;
 
     fn create_test_repo(dir: &std::path::Path, file_name: &str, content: &str, msg: &str) {
         let repo = Repository::init(dir).unwrap();
@@ -159,8 +334,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_test_repo_two_commits(tmp.path());
 
-        let paths = vec![tmp.path().to_path_buf()];
-        let (commits, errors) = analyze_repos(&paths, None, None);
+        let repos = normalize_repo_inputs(vec![tmp.path().to_path_buf()], None).unwrap();
+        let (commits, errors) = analyze_repos(&repos, None, None);
 
         assert!(
             errors.is_empty(),
@@ -183,6 +358,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         assert_eq!(commits[0].repo, expected_name);
+        assert_eq!(commits[0].repo_id, repos[0].id);
     }
 
     #[test]
@@ -193,8 +369,12 @@ mod tests {
         create_test_repo(tmp1.path(), "main.rs", "fn main() {}\n", "Repo1 commit");
         create_test_repo(tmp2.path(), "lib.py", "print('hi')\n", "Repo2 commit");
 
-        let paths = vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()];
-        let (commits, errors) = analyze_repos(&paths, None, None);
+        let repos = normalize_repo_inputs(
+            vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()],
+            None,
+        )
+        .unwrap();
+        let (commits, errors) = analyze_repos(&repos, None, None);
 
         assert!(errors.is_empty());
         assert_eq!(commits.len(), 2);
@@ -222,8 +402,10 @@ mod tests {
         create_test_repo(tmp_good.path(), "file.txt", "content\n", "Good commit");
 
         let bad_path = PathBuf::from("/nonexistent/fake/repo");
-        let paths = vec![bad_path.clone(), tmp_good.path().to_path_buf()];
-        let (commits, errors) = analyze_repos(&paths, None, None);
+        let repos =
+            normalize_repo_inputs(vec![bad_path.clone(), tmp_good.path().to_path_buf()], None)
+                .unwrap();
+        let (commits, errors) = analyze_repos(&repos, None, None);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, bad_path);
@@ -234,9 +416,137 @@ mod tests {
 
     #[test]
     fn test_analyze_empty_paths() {
-        let paths: Vec<PathBuf> = vec![];
-        let (commits, errors) = analyze_repos(&paths, None, None);
+        let repos: Vec<RepoInput> = vec![];
+        let (commits, errors) = analyze_repos(&repos, None, None);
         assert!(commits.is_empty());
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_until_is_exclusive() {
+        let tmp = TempDir::new().unwrap();
+        create_test_repo(tmp.path(), "file.txt", "content\n", "Commit at boundary");
+        let repos = normalize_repo_inputs(vec![tmp.path().to_path_buf()], None).unwrap();
+        let boundary = DateTime::from_timestamp(1_705_312_800, 0).unwrap();
+
+        let (commits, errors) = analyze_repos(&repos, None, Some(boundary));
+
+        assert!(errors.is_empty());
+        assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn normalize_repo_inputs_deduplicates_and_disambiguates_labels() {
+        let tmp = TempDir::new().unwrap();
+        let left = tmp.path().join("left").join("service");
+        let right = tmp.path().join("right").join("service");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        create_test_repo(&left, "left.rs", "fn left() {}\n", "left");
+        create_test_repo(&right, "right.rs", "fn right() {}\n", "right");
+
+        let repos = normalize_repo_inputs(vec![left.clone(), left, right], None).unwrap();
+
+        assert_eq!(repos.len(), 2);
+        assert!(repos.iter().all(|repo| repo.id.contains('/')));
+        assert_eq!(repos[0].label, "left/service");
+        assert_eq!(repos[1].label, "right/service");
+    }
+
+    #[test]
+    fn merge_commit_counts_once_without_replaying_parent_churn() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let base_sig =
+            Signature::new("Test", "test@example.com", &Time::new(1_705_312_800, 0)).unwrap();
+        let base_blob = repo.blob(b"base\n").unwrap();
+        let mut base_tree_builder = repo.treebuilder(None).unwrap();
+        base_tree_builder
+            .insert("base.rs", base_blob, 0o100644)
+            .unwrap();
+        let base_tree = repo.find_tree(base_tree_builder.write().unwrap()).unwrap();
+        let base_oid = repo
+            .commit(Some("HEAD"), &base_sig, &base_sig, "Base", &base_tree, &[])
+            .unwrap();
+        let base = repo.find_commit(base_oid).unwrap();
+
+        let main_sig =
+            Signature::new("Test", "test@example.com", &Time::new(1_705_316_400, 0)).unwrap();
+        let main_blob = repo.blob(b"base\nmain\n").unwrap();
+        let mut main_tree_builder = repo.treebuilder(Some(&base_tree)).unwrap();
+        main_tree_builder
+            .insert("base.rs", main_blob, 0o100644)
+            .unwrap();
+        let main_tree = repo.find_tree(main_tree_builder.write().unwrap()).unwrap();
+        let main_oid = repo
+            .commit(
+                Some("HEAD"),
+                &main_sig,
+                &main_sig,
+                "Main",
+                &main_tree,
+                &[&base],
+            )
+            .unwrap();
+        let main = repo.find_commit(main_oid).unwrap();
+
+        let feature_sig =
+            Signature::new("Test", "test@example.com", &Time::new(1_705_320_000, 0)).unwrap();
+        let feature_blob = repo.blob(b"feature\n").unwrap();
+        let mut feature_tree_builder = repo.treebuilder(Some(&base_tree)).unwrap();
+        feature_tree_builder
+            .insert("feature.rs", feature_blob, 0o100644)
+            .unwrap();
+        let feature_tree = repo
+            .find_tree(feature_tree_builder.write().unwrap())
+            .unwrap();
+        let feature_oid = repo
+            .commit(
+                None,
+                &feature_sig,
+                &feature_sig,
+                "Feature",
+                &feature_tree,
+                &[&base],
+            )
+            .unwrap();
+        let feature = repo.find_commit(feature_oid).unwrap();
+
+        let merge_sig =
+            Signature::new("Test", "test@example.com", &Time::new(1_705_323_600, 0)).unwrap();
+        let mut merge_tree_builder = repo.treebuilder(Some(&main_tree)).unwrap();
+        merge_tree_builder
+            .insert("feature.rs", feature_blob, 0o100644)
+            .unwrap();
+        let merge_tree = repo.find_tree(merge_tree_builder.write().unwrap()).unwrap();
+        let merge_oid = repo
+            .commit(
+                Some("HEAD"),
+                &merge_sig,
+                &merge_sig,
+                "Merge feature",
+                &merge_tree,
+                &[&main, &feature],
+            )
+            .unwrap();
+
+        let repos = normalize_repo_inputs(vec![tmp.path().to_path_buf()], None).unwrap();
+        let (commits, errors) = analyze_repos(&repos, None, None);
+
+        assert!(errors.is_empty());
+        assert_eq!(commits.len(), 4);
+        let merge = commits
+            .iter()
+            .find(|commit| commit.oid == merge_oid.to_string())
+            .unwrap();
+        assert!(merge.file_changes.is_empty());
+        let aggregate = aggregate_commits(&commits, &Period::Day, None, None);
+        assert_eq!(
+            aggregate
+                .iter()
+                .map(|stats| stats.total_commits)
+                .sum::<u64>(),
+            4
+        );
     }
 }

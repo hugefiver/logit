@@ -65,6 +65,7 @@ mod tests {
     #[test]
     fn commit_involves_author_checks_author() {
         let commit = CommitStats {
+            repo_id: "test-id".to_string(),
             repo: "test".to_string(),
             oid: "abc".to_string(),
             author: Author {
@@ -88,6 +89,7 @@ mod tests {
     #[test]
     fn commit_involves_author_checks_co_authors() {
         let commit = CommitStats {
+            repo_id: "test-id".to_string(),
             repo: "test".to_string(),
             oid: "abc".to_string(),
             author: Author {
@@ -113,6 +115,7 @@ mod tests {
     #[test]
     fn commit_involves_author_matches_email_domain() {
         let commit = CommitStats {
+            repo_id: "test-id".to_string(),
             repo: "test".to_string(),
             oid: "abc".to_string(),
             author: Author {

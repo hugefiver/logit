@@ -21,28 +21,36 @@ pub enum Platform {
 
 #[cfg(feature = "github")]
 pub fn parse_remote_url(url: &str) -> Option<RemoteInfo> {
-    let (platform, path) = if let Some(rest) = url.strip_prefix("https://github.com/")
+    let (platform, path) = if let Some(rest) = url
+        .strip_prefix("https://github.com/")
         .or_else(|| url.strip_prefix("http://github.com/"))
     {
         (Platform::GitHub, rest)
-    } else if let Some(rest) = url.strip_prefix("https://gitlab.com/")
+    } else if let Some(rest) = url
+        .strip_prefix("https://gitlab.com/")
         .or_else(|| url.strip_prefix("http://gitlab.com/"))
     {
         (Platform::GitLab, rest)
     } else if let Some(rest) = url.strip_prefix("git@github.com:") {
         (Platform::GitHub, rest)
-    } else if let Some(rest) = url.strip_prefix("git@gitlab.com:") {
-        (Platform::GitLab, rest)
     } else {
-        return None;
+        let rest = url.strip_prefix("git@gitlab.com:")?;
+        (Platform::GitLab, rest)
     };
 
-    let path = path.trim_end_matches('/').strip_suffix(".git").unwrap_or(path.trim_end_matches('/'));
+    let path = path
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_end_matches('/'));
     let (owner, repo) = path.split_once('/')?;
     if owner.is_empty() || repo.is_empty() || repo.contains('/') {
         return None;
     }
-    Some(RemoteInfo { platform, owner: owner.to_string(), repo: repo.to_string() })
+    Some(RemoteInfo {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
 }
 
 #[cfg(feature = "github")]
@@ -54,7 +62,6 @@ pub fn get_remote_origin(repo_path: &Path) -> Option<String> {
 
 pub struct RepoAnalyzer {
     repo: Repository,
-    repo_name: String,
 }
 
 /// Extracted commit information from a git repository.
@@ -74,27 +81,19 @@ impl RepoAnalyzer {
     pub fn open(path: &Path) -> Result<Self> {
         let repo = Repository::open(path)
             .with_context(|| format!("Failed to open git repo at {}", path.display()))?;
-        let repo_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
-        Ok(Self { repo, repo_name })
-    }
-
-    pub fn repo_name(&self) -> &str {
-        &self.repo_name
+        Ok(Self { repo })
     }
 
     pub fn repo(&self) -> &Repository {
         &self.repo
     }
 
-    /// Walk commits from HEAD, optionally filtered by date range.
+    /// Walk commits from HEAD, optionally filtered by a date range with an exclusive end.
     /// Returns commits in chronological order (oldest first).
     pub fn walk_commits(
         &self,
         since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        until_exclusive: Option<DateTime<Utc>>,
     ) -> Result<Vec<CommitInfo>> {
         let head = match self.repo.head() {
             Ok(h) => h,
@@ -122,15 +121,17 @@ impl RepoAnalyzer {
                 .with_context(|| format!("Failed to find commit {oid}"))?;
 
             let time = commit.time();
-            let timestamp = DateTime::from_timestamp(time.seconds(), 0).unwrap_or_default();
+            let timestamp = DateTime::from_timestamp(time.seconds(), 0).ok_or_else(|| {
+                anyhow::anyhow!("invalid Git timestamp {} for commit {oid}", time.seconds())
+            })?;
 
             if let Some(ref s) = since
                 && timestamp < *s
             {
                 continue;
             }
-            if let Some(ref u) = until
-                && timestamp > *u
+            if let Some(ref u) = until_exclusive
+                && timestamp >= *u
             {
                 continue;
             }
@@ -276,6 +277,102 @@ mod tests {
         assert!(commits[0].parent_oids.is_empty());
         // Second commit has one parent
         assert_eq!(commits[1].parent_oids.len(), 1);
+    }
+
+    #[test]
+    fn invalid_git_timestamp_is_analysis_error() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let blob = repo.blob(b"hello").unwrap();
+        let mut tree_builder = repo.treebuilder(None).unwrap();
+        tree_builder.insert("file.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let commit = format!(
+            "tree {}\nauthor Test <test@test.com> {} +0000\ncommitter Test <test@test.com> {} +0000\n\nInvalid timestamp\n",
+            tree.id(),
+            i64::MAX,
+            i64::MAX
+        );
+        let oid = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Commit, commit.as_bytes())
+            .unwrap();
+        repo.reference(
+            "refs/heads/main",
+            oid,
+            true,
+            "set invalid timestamp test HEAD",
+        )
+        .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let analyzer = RepoAnalyzer::open(tmp.path()).unwrap();
+
+        let error = match analyzer.walk_commits(None, None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("invalid Git timestamp must fail analysis"),
+        };
+
+        assert!(error.contains(&i64::MAX.to_string()));
+        assert!(error.contains(&oid.to_string()));
+    }
+
+    #[test]
+    fn until_exclusive_includes_last_second_of_named_day_and_excludes_next_midnight() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let last_second =
+            git2::Signature::new("Test", "test@test.com", &git2::Time::new(1_705_449_599, 0))
+                .unwrap();
+        let blob = repo.blob(b"before midnight").unwrap();
+        let mut initial_tree_builder = repo.treebuilder(None).unwrap();
+        initial_tree_builder
+            .insert("file.txt", blob, 0o100644)
+            .unwrap();
+        let initial_tree = repo
+            .find_tree(initial_tree_builder.write().unwrap())
+            .unwrap();
+        let first_oid = repo
+            .commit(
+                Some("HEAD"),
+                &last_second,
+                &last_second,
+                "Last second",
+                &initial_tree,
+                &[],
+            )
+            .unwrap();
+        let first = repo.find_commit(first_oid).unwrap();
+        let midnight =
+            git2::Signature::new("Test", "test@test.com", &git2::Time::new(1_705_449_600, 0))
+                .unwrap();
+        let blob = repo.blob(b"at midnight").unwrap();
+        let mut midnight_tree_builder = repo.treebuilder(Some(&initial_tree)).unwrap();
+        midnight_tree_builder
+            .insert("file.txt", blob, 0o100644)
+            .unwrap();
+        let midnight_tree = repo
+            .find_tree(midnight_tree_builder.write().unwrap())
+            .unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &midnight,
+            &midnight,
+            "Next midnight",
+            &midnight_tree,
+            &[&first],
+        )
+        .unwrap();
+        let analyzer = RepoAnalyzer::open(tmp.path()).unwrap();
+        let until_exclusive = DateTime::from_timestamp(1_705_449_600, 0).unwrap();
+
+        let commits = analyzer.walk_commits(None, Some(until_exclusive)).unwrap();
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].timestamp,
+            DateTime::from_timestamp(1_705_449_599, 0).unwrap()
+        );
     }
 
     #[cfg(feature = "github")]

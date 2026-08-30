@@ -1,6 +1,7 @@
 use colored::Colorize;
 
 use crate::cli;
+use crate::output::presentation::{PresentationMetrics, PresentationRow, PresentationRowKind};
 
 pub const COL_SEP: usize = 2;
 
@@ -27,20 +28,6 @@ impl DisplayCol {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RowMetric {
-    pub commits: u64,
-    pub adds: u64,
-    pub dels: u64,
-    pub files: u64,
-}
-
-impl RowMetric {
-    pub fn net(&self) -> i64 {
-        self.adds as i64 - self.dels as i64
-    }
-}
-
 pub fn build_display_cols(cols: &[crate::cli::Column], compact: bool) -> Vec<DisplayCol> {
     let mut out = Vec::with_capacity(cols.len());
     let mut i = 0;
@@ -64,6 +51,22 @@ pub fn build_display_cols(cols: &[crate::cli::Column], compact: bool) -> Vec<Dis
     out
 }
 
+pub fn format_presentation_label(
+    row: &PresentationRow,
+    columns: &[cli::Column],
+    num_fmt: cli::NumberFormat,
+) -> String {
+    if row.kind != PresentationRowKind::Language && !columns.contains(&cli::Column::Commits) {
+        format!(
+            "{} ({} commits)",
+            row.label,
+            crate::output::table::format_num(row.metrics.commits, num_fmt)
+        )
+    } else {
+        row.label.clone()
+    }
+}
+
 fn net_display(net: i64, num_fmt: cli::NumberFormat) -> String {
     let abs = crate::output::table::format_num(net.unsigned_abs(), num_fmt);
     if net >= 0 {
@@ -85,18 +88,30 @@ impl ColLayout {
     pub fn build(
         cols: &[crate::cli::Column],
         compact: bool,
-        rows: &[RowMetric],
+        rows: &[PresentationMetrics],
         num_fmt: cli::NumberFormat,
     ) -> Self {
         let cols = build_display_cols(cols, compact);
         let change_add_w = rows
             .iter()
-            .map(|r| format!("+{}", crate::output::table::format_num(r.adds, num_fmt)).len())
+            .map(|r| {
+                format!(
+                    "+{}",
+                    crate::output::table::format_num(r.additions, num_fmt)
+                )
+                .len()
+            })
             .max()
             .unwrap_or(2);
         let change_del_w = rows
             .iter()
-            .map(|r| format!("-{}", crate::output::table::format_num(r.dels, num_fmt)).len())
+            .map(|r| {
+                format!(
+                    "-{}",
+                    crate::output::table::format_num(r.deletions, num_fmt)
+                )
+                .len()
+            })
             .max()
             .unwrap_or(2);
 
@@ -109,8 +124,12 @@ impl ColLayout {
                         DisplayCol::Commits => {
                             crate::output::table::format_num(r.commits, num_fmt).len()
                         }
-                        DisplayCol::Adds => crate::output::table::format_num(r.adds, num_fmt).len(),
-                        DisplayCol::Dels => crate::output::table::format_num(r.dels, num_fmt).len(),
+                        DisplayCol::Adds => {
+                            crate::output::table::format_num(r.additions, num_fmt).len()
+                        }
+                        DisplayCol::Dels => {
+                            crate::output::table::format_num(r.deletions, num_fmt).len()
+                        }
                         DisplayCol::Changes => change_add_w + 1 + change_del_w,
                         DisplayCol::Net => net_display(r.net(), num_fmt).len(),
                         DisplayCol::Files => {
@@ -134,7 +153,7 @@ impl ColLayout {
 
 pub fn format_cell(
     dc: DisplayCol,
-    metric: &RowMetric,
+    metric: &PresentationMetrics,
     num_fmt: cli::NumberFormat,
     width: usize,
     change_add_w: usize,
@@ -145,11 +164,11 @@ pub fn format_cell(
         DisplayCol::Changes => {
             let add_s = format!(
                 "+{}",
-                crate::output::table::format_num(metric.adds, num_fmt)
+                crate::output::table::format_num(metric.additions, num_fmt)
             );
             let del_s = format!(
                 "-{}",
-                crate::output::table::format_num(metric.dels, num_fmt)
+                crate::output::table::format_num(metric.deletions, num_fmt)
             );
             let add_aligned = format!("{:>w$}", add_s, w = change_add_w);
             let del_aligned = format!("{:>w$}", del_s, w = change_del_w);
@@ -186,7 +205,7 @@ pub fn format_cell(
         DisplayCol::Adds => {
             let s = format!(
                 "{:>w$}",
-                crate::output::table::format_num(metric.adds, num_fmt),
+                crate::output::table::format_num(metric.additions, num_fmt),
                 w = width,
             );
             if bold {
@@ -198,7 +217,7 @@ pub fn format_cell(
         DisplayCol::Dels => {
             let s = format!(
                 "{:>w$}",
-                crate::output::table::format_num(metric.dels, num_fmt),
+                crate::output::table::format_num(metric.deletions, num_fmt),
                 w = width,
             );
             if bold {
@@ -249,7 +268,7 @@ pub fn header_row(label_col_header: &str, label_col_w: usize, layout: &ColLayout
 pub fn data_row(
     label: &str,
     label_w: usize,
-    metric: &RowMetric,
+    metric: &PresentationMetrics,
     layout: &ColLayout,
     num_fmt: cli::NumberFormat,
     indent: &str,

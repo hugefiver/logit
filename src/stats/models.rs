@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitStats {
+    #[serde(default)]
+    pub repo_id: String,
     pub repo: String,
     pub oid: String,
     pub author: Author,
@@ -195,6 +197,7 @@ mod tests {
     #[test]
     fn serde_round_trip_commit_stats() {
         let commit = CommitStats {
+            repo_id: "/workspace/logit".to_string(),
             repo: "logit".to_string(),
             oid: "abc123".to_string(),
             author: Author {
@@ -225,6 +228,7 @@ mod tests {
         let deserialized: CommitStats = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.repo, commit.repo);
+        assert_eq!(deserialized.repo_id, commit.repo_id);
         assert_eq!(deserialized.oid, commit.oid);
         assert_eq!(deserialized.author, commit.author);
         assert_eq!(deserialized.committer, commit.committer);
@@ -235,6 +239,33 @@ mod tests {
         assert_eq!(deserialized.file_changes[0].path, "src/lib.rs");
         assert_eq!(deserialized.file_changes[0].additions, 50);
         assert_eq!(deserialized.file_changes[0].deletions, 10);
+    }
+
+    #[test]
+    fn deserialize_commit_stats_without_repo_id_uses_default() {
+        let commit = CommitStats {
+            repo_id: "/workspace/logit".to_string(),
+            repo: "logit".to_string(),
+            oid: "abc123".to_string(),
+            author: Author {
+                name: "Alice".to_string(),
+                email: "alice@example.com".to_string(),
+            },
+            committer: Author {
+                name: "Alice".to_string(),
+                email: "alice@example.com".to_string(),
+            },
+            co_authors: vec![],
+            timestamp: Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap(),
+            message_subject: "feat: add stats".to_string(),
+            file_changes: vec![],
+        };
+        let mut json = serde_json::to_value(commit).unwrap();
+        json.as_object_mut().unwrap().remove("repo_id");
+
+        let deserialized: CommitStats = serde_json::from_value(json).unwrap();
+
+        assert!(deserialized.repo_id.is_empty());
     }
 
     #[test]
