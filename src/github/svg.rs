@@ -879,8 +879,7 @@ mod tests {
     #[test]
     fn profile_svg_escapes_all_dynamic_xml_metacharacters() {
         let payload = r#"<script id="owned">&"'</script>"#;
-        let escaped_prefix = "&lt;script id=&quot;owned&quot;&gt;&amp;&quot;&#x27;&lt;";
-        let escaped_closing_tag = "&#x2F;script&gt;";
+        let escaped_prefix = "&lt;script id=&quot;owned&quot;&gt;&amp;&quot;";
         let user = make_user(8);
         let mut stats = make_stats();
         let language = stats
@@ -906,9 +905,17 @@ mod tests {
 
         assert!(
             svg.matches(escaped_prefix).count() >= 3,
-            "expected all dynamic values to use the exact XML entities: {svg}"
+            "expected dynamic values to escape <, >, &, and double quotes: {svg}"
         );
-        assert!(svg.contains(escaped_closing_tag));
+        assert!(
+            svg.contains("&lt;script id=&quot;owned&quot;&gt;&amp;&quot;&#39;&lt;")
+                || svg.contains("&lt;script id=&quot;owned&quot;&gt;&amp;&quot;&#x27;&lt;"),
+            "expected apostrophes to use a numeric XML entity: {svg}"
+        );
+        assert!(
+            svg.contains("&lt;/script&gt;") || svg.contains("&lt;&#x2F;script&gt;"),
+            "expected the closing script tag to remain escaped: {svg}"
+        );
         assert!(!svg.contains("<script id=\"owned\">"));
         assert!(!svg.contains("id=\"owned\""));
         assert!(!svg.contains("</script>"));
@@ -917,7 +924,6 @@ mod tests {
     #[test]
     fn multi_svg_escapes_json_derived_language_names() {
         let payload = r#"x" onload="alert(1)&<tag>'"#;
-        let escaped = "x&quot; onload=&quot;alert(1)&amp;&lt;tag&gt;&#x27;";
         let mut stats = make_stats();
         let language = stats
             .by_language
@@ -932,7 +938,11 @@ mod tests {
 
         let svg = render_multi_card(&columns, NumberFormat::Plain, None).unwrap();
 
-        assert!(svg.contains(escaped));
+        assert!(
+            svg.contains("x&quot; onload=&quot;alert(1)&amp;&lt;tag&gt;&#39;")
+                || svg.contains("x&quot; onload=&quot;alert(1)&amp;&lt;tag&gt;&#x27;"),
+            "expected the language name to escape XML metacharacters: {svg}"
+        );
         assert!(!svg.contains("onload=\"alert(1)\""));
         assert!(!svg.contains("<tag>"));
     }

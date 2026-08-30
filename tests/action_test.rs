@@ -26,19 +26,27 @@ const INPUT_NAMES: [&str; 16] = [
     "retry-delay",
 ];
 
+fn normalized_source(path: impl AsRef<Path>, error_message: &str) -> String {
+    fs::read_to_string(path)
+        .expect(error_message)
+        .replace("\r\n", "\n")
+}
+
 fn action_source() -> String {
-    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml"))
-        .expect("read action.yml")
+    normalized_source(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml"),
+        "read action.yml",
+    )
 }
 
 fn ci_source() -> String {
-    fs::read_to_string(
+    normalized_source(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".github")
             .join("workflows")
             .join("ci.yml"),
+        "read CI workflow",
     )
-    .expect("read CI workflow")
 }
 
 fn declared_input_names(source: &str) -> Vec<String> {

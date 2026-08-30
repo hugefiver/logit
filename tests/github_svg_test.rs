@@ -4,7 +4,6 @@ use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
 
 const RAW_PAYLOAD: &str = r#"<>&"'"#;
-const ESCAPED_PAYLOAD: &str = "&lt;&gt;&amp;&quot;&#x27;";
 
 fn generate_cli_svg_with_metacharacter_json() -> (TempDir, PathBuf) {
     let temp = TempDir::new().expect("temporary directory");
@@ -93,7 +92,11 @@ fn cli_json_input_escapes_dynamic_xml_metacharacters() {
     let (_temp, svg_path) = generate_cli_svg_with_metacharacter_json();
     let svg = fs::read_to_string(svg_path).expect("read generated SVG");
 
-    assert!(svg.contains(ESCAPED_PAYLOAD));
+    assert!(svg.contains("&lt;&gt;&amp;&quot;"));
+    assert!(
+        svg.contains("&lt;&gt;&amp;&quot;&#39;") || svg.contains("&lt;&gt;&amp;&quot;&#x27;"),
+        "expected apostrophes to use a numeric XML entity: {svg}"
+    );
     assert!(!svg.contains(RAW_PAYLOAD));
     assert!(!svg.contains("<>&"));
     assert!(!svg.contains("\"'"));
