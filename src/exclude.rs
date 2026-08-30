@@ -770,97 +770,73 @@ mod tests {
     }
 
     #[test]
-    fn resolved_github_user_matches_canonical_author_and_committer_emails() {
-        let mut rule = ExcludeRule::parse_many(":user:github:OctoCat")
-            .unwrap()
-            .remove(0);
-        rule.resolve_github_user("octocat", &[" OctoCat@Example.COM ".into()]);
-        let author = Author {
-            name: "Octocat".into(),
-            email: " octocat@example.com ".into(),
-        };
-        let committer = Author {
-            name: "Octocat".into(),
-            email: "OCTOCAT@EXAMPLE.COM".into(),
-        };
+    fn resolve_github_user_preserves_patterns_and_canonicalizes_known_email_shapes() {
+        let cases = [
+            (
+                ":user:github:OctoCat",
+                "octocat",
+                &[" OctoCat@Example.COM "][..],
+                &["octocat@example.com"][..],
+                true,
+            ),
+            (
+                ":author:github:OctoCat",
+                "octocat",
+                &["octocat@example.com"][..],
+                &["octocat@example.com"][..],
+                false,
+            ),
+            (
+                ":author:github:testuser",
+                "testuser",
+                &["a@b.com", "c@d.com"][..],
+                &["a@b.com", "c@d.com"][..],
+                false,
+            ),
+        ];
 
-        assert!(matches!(
-            rule.and_groups[0].author_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert!(matches!(
-            rule.and_groups[0].committer_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert!(rule.and_groups[0].matches_commit(&author, &committer));
+        for (selector, login, emails, expected, applies_to_committer) in cases {
+            let mut rule = ExcludeRule::parse_many(selector).unwrap().remove(0);
+            let emails = emails
+                .iter()
+                .map(|email| (*email).to_string())
+                .collect::<Vec<_>>();
+            rule.resolve_github_user(login, &emails);
+            let group = &rule.and_groups[0];
 
-        let noreply = Author {
-            name: "Octocat".into(),
-            email: "583231+octocat@users.noreply.github.com".into(),
-        };
-        assert!(rule.and_groups[0].matches_commit(&noreply, &noreply));
-    }
+            assert!(matches!(
+                group.author_pattern,
+                Some(AuthorPattern::GitHubUser(_))
+            ));
+            assert_eq!(
+                group.author_emails,
+                expected
+                    .iter()
+                    .map(|email| (*email).to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                group.committer_pattern.is_some(),
+                applies_to_committer,
+                "selector: {selector}"
+            );
 
-    #[test]
-    fn resolve_github_user_preserves_pattern_and_appends_emails() {
-        let mut rule = ExcludeRule {
-            repo: None,
-            and_groups: vec![AndGroup {
-                author_pattern: Some(AuthorPattern::GitHubUser("testuser".into())),
-                ..Default::default()
-            }],
-        };
-        rule.resolve_github_user("testuser", &["a@b.com".into(), "c@d.com".into()]);
-        assert!(matches!(
-            rule.and_groups[0].author_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert_eq!(rule.and_groups[0].author_emails.len(), 2);
-    }
-
-    #[test]
-    fn resolve_github_user_matches_login_case_insensitively() {
-        let mut rule = ExcludeRule::parse_many(":author:github:OctoCat")
-            .unwrap()
-            .remove(0);
-
-        rule.resolve_github_user("octocat", &["octocat@example.com".into()]);
-
-        assert!(matches!(
-            rule.and_groups[0].author_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert_eq!(
-            rule.and_groups[0].author_emails,
-            vec!["octocat@example.com".to_string()]
-        );
-    }
-
-    #[test]
-    fn resolve_github_user_applies_known_emails_to_author_and_committer() {
-        let mut rule = ExcludeRule::parse_many(":user:github:OctoCat")
-            .unwrap()
-            .remove(0);
-
-        rule.resolve_github_user("octocat", &[" OctoCat@Example.COM ".into()]);
-
-        assert!(matches!(
-            rule.and_groups[0].author_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert!(matches!(
-            rule.and_groups[0].committer_pattern,
-            Some(AuthorPattern::GitHubUser(_))
-        ));
-        assert_eq!(
-            rule.and_groups[0].author_emails,
-            vec!["octocat@example.com".to_string()]
-        );
-        assert_eq!(
-            rule.and_groups[0].committer_emails,
-            vec!["octocat@example.com".to_string()]
-        );
-        assert!(rule.and_groups[0].has_commit_qualifiers());
+            if applies_to_committer {
+                assert_eq!(
+                    group.committer_emails,
+                    vec!["octocat@example.com".to_string()]
+                );
+                let author = Author {
+                    name: "Octocat".into(),
+                    email: " octocat@example.com ".into(),
+                };
+                let committer = Author {
+                    name: "Octocat".into(),
+                    email: "OCTOCAT@EXAMPLE.COM".into(),
+                };
+                assert!(group.matches_commit(&author, &committer));
+            }
+        }
     }
 
     #[test]

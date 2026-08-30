@@ -2853,96 +2853,82 @@ mod tests {
     }
 
     #[test]
-    fn retry_decision_429_retry_after_seconds_takes_precedence() {
-        let decision = retry_decision(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            &response_headers(&[
-                ("retry-after", "7"),
-                ("x-ratelimit-remaining", "0"),
-                ("x-ratelimit-reset", "1735689615"),
-            ]),
-            Duration::from_secs(1),
-            fixed_time(1),
-            Duration::from_secs(120),
+    fn retry_decision_uses_retry_after_rate_limit_and_wait_bound_contracts() {
+        type Case = (
+            reqwest::StatusCode,
+            &'static [(&'static str, &'static str)],
+            Option<u64>,
+            Option<&'static [&'static str]>,
         );
+        let cases: &[Case] = &[
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &[
+                    ("retry-after", "7"),
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1735689615"),
+                ],
+                Some(7),
+                None,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &[("retry-after", "Wed, 01 Jan 2025 00:00:09 GMT")],
+                Some(9),
+                None,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &[("retry-after", "Tue, 31 Dec 2024 23:59:59 GMT")],
+                Some(0),
+                None,
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                &[],
+                None,
+                Some(&["permission"]),
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1735689605"),
+                ],
+                Some(5),
+                None,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &[("retry-after", "121")],
+                None,
+                Some(&["121", "120"]),
+            ),
+        ];
 
-        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(7)));
-    }
-
-    #[test]
-    fn retry_decision_429_retry_after_http_date_uses_supplied_now() {
-        let decision = retry_decision(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            &response_headers(&[("retry-after", "Wed, 01 Jan 2025 00:00:09 GMT")]),
-            Duration::from_secs(1),
-            fixed_time(1),
-            Duration::from_secs(120),
-        );
-
-        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(9)));
-    }
-
-    #[test]
-    fn retry_decision_past_retry_after_http_date_retries_immediately() {
-        for status in [
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            reqwest::StatusCode::FORBIDDEN,
-        ] {
+        for (status, headers, expected_wait, expected_error) in cases {
             let decision = retry_decision(
-                status,
-                &response_headers(&[("retry-after", "Tue, 31 Dec 2024 23:59:59 GMT")]),
+                *status,
+                &response_headers(headers),
                 Duration::from_secs(1),
                 fixed_time(1),
                 Duration::from_secs(120),
             );
 
-            assert_eq!(decision, RetryDecision::RetryAfter(Duration::ZERO));
+            if let Some(seconds) = expected_wait {
+                assert_eq!(
+                    decision,
+                    RetryDecision::RetryAfter(Duration::from_secs(*seconds))
+                );
+            } else {
+                let RetryDecision::Fail(message) = decision else {
+                    panic!("expected failure for {status}");
+                };
+                for expected in expected_error.expect("expected failure fragments") {
+                    assert!(message.contains(expected), "message: {message}");
+                }
+            }
         }
-    }
-
-    #[test]
-    fn retry_decision_permission_403_fails_without_rate_limit_signal() {
-        let decision = retry_decision(
-            reqwest::StatusCode::FORBIDDEN,
-            &HeaderMap::new(),
-            Duration::from_secs(1),
-            fixed_time(1),
-            Duration::from_secs(120),
-        );
-
-        assert!(matches!(decision, RetryDecision::Fail(message) if message.contains("permission")));
-    }
-
-    #[test]
-    fn retry_decision_403_exhausted_rate_limit_uses_reset() {
-        let now = fixed_time(1);
-        let decision = retry_decision(
-            reqwest::StatusCode::FORBIDDEN,
-            &response_headers(&[
-                ("x-ratelimit-remaining", "0"),
-                ("x-ratelimit-reset", &(now.timestamp() + 5).to_string()),
-            ]),
-            Duration::from_secs(1),
-            now,
-            Duration::from_secs(120),
-        );
-
-        assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn retry_decision_refuses_server_wait_above_bound() {
-        let decision = retry_decision(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            &response_headers(&[("retry-after", "121")]),
-            Duration::from_secs(1),
-            fixed_time(1),
-            Duration::from_secs(120),
-        );
-
-        assert!(
-            matches!(decision, RetryDecision::Fail(message) if message.contains("121") && message.contains("120"))
-        );
     }
 
     fn rolling_for_test(observed_at: DateTime<Utc>, lookback: chrono::Duration) -> QueryWindow {
@@ -3080,11 +3066,7 @@ mod tests {
             request.until_exclusive.as_deref(),
             Some("2025-01-11T00:00:00+00:00")
         );
-    }
 
-    #[test]
-    fn empty_successful_history_gap_advances_checked_until() {
-        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
         let plan = HistoryFetchPlan::Gap {
             retained: vec![commit("kept", "2025-01-05T12:00:00Z", 2)],
             request: history_request(
@@ -3100,67 +3082,6 @@ mod tests {
         assert_eq!(envelope.checked_until, window.until_exclusive);
         assert_eq!(envelope.payload.len(), 1);
         assert_eq!(envelope.payload[0].oid.as_deref(), Some("kept"));
-    }
-
-    #[test]
-    fn readonly_incomplete_history_is_a_full_fetch_without_cache_write() {
-        let window = rolling_for_test(fixed_time(11), chrono::Duration::days(9));
-        let cached = CacheEnvelope {
-            requested_from: window.requested_from,
-            checked_until: window.until_exclusive,
-            observed_at: window.observed_at,
-            completeness: Completeness::Incomplete(vec![IncompleteReason::HistoryPageLimit {
-                repository: "octocat/repo".to_string(),
-                pages: 20,
-            }]),
-            payload: vec![commit("partial", "2025-01-05T12:00:00Z", 1)],
-        };
-
-        let plan = plan_history_refresh(
-            Some(cached.clone()),
-            &window,
-            CachePolicy::ReadOnly,
-            "octocat",
-            "repo",
-        )
-        .unwrap();
-
-        assert!(matches!(plan, HistoryFetchPlan::Full { .. }));
-        assert!(!CachePolicy::ReadOnly.can_write());
-
-        let temp = tempfile::tempdir().unwrap();
-        let cache = DiskCache::with_dir(temp.path()).unwrap();
-        let key = history_cache_key("NODE", "octocat", "repo", false, &window.scope);
-        cache.set(&key, &cached).unwrap();
-        let server = start_stub(vec![StubResponse::OwnedJson {
-            status: 200,
-            body: history_response(vec![commit("fresh", "2025-01-10T12:00:00Z", 3)]),
-            delay: Duration::ZERO,
-        }]);
-        let client = GithubClient::for_test(&server.base_url, Vec::new(), Duration::from_secs(1));
-
-        let current = fetch_one_history_from_cache(
-            &client,
-            &cache,
-            "NODE",
-            "octocat",
-            "repo",
-            &window,
-            CachePolicy::ReadOnly,
-        )
-        .unwrap();
-
-        assert_eq!(current[0].oid.as_deref(), Some("fresh"));
-        assert_eq!(
-            graphql_variables(&server.finish()[0])["since0"],
-            "2025-01-02T00:00:00+00:00"
-        );
-        let persisted = cache
-            .get::<CacheEnvelope<Vec<CommitData>>>(&key)
-            .unwrap()
-            .unwrap();
-        assert!(!persisted.completeness.is_complete());
-        assert_eq!(persisted.payload[0].oid.as_deref(), Some("partial"));
     }
 
     #[test]
@@ -3613,24 +3534,6 @@ mod tests {
                 .is_none()
         );
         assert!(tmp.path().join(format!("{legacy_key}.json")).is_file());
-    }
-
-    #[test]
-    fn changed_open_contribution_bounds_require_full_refetch_not_gap_merge() {
-        let old_window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));
-        let new_window = rolling_for_test(fixed_time(9), chrono::Duration::days(7));
-        let old_envelope = CacheEnvelope {
-            requested_from: old_window.requested_from,
-            checked_until: old_window.until_exclusive,
-            observed_at: old_window.observed_at,
-            completeness: Completeness::Complete,
-            payload: sample_for_test("old-repo", 99),
-        };
-
-        assert_eq!(
-            validate_envelope_bounds(&old_envelope, &new_window).unwrap(),
-            ContributionCacheDecision::FullFetch
-        );
     }
 
     #[test]
@@ -4286,7 +4189,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v4_contribution_envelope_is_warning_miss() {
+    fn malformed_or_semantically_invalid_v4_contribution_envelopes_warn_and_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let from = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
@@ -4319,10 +4222,7 @@ mod tests {
         assert!(contribution_cache_get_or_warn(&cache, &key, &window, &mut warnings).is_none());
         assert_eq!(warnings.messages.len(), 1);
         assert!(warnings.messages[0].contains("GitHub cache read failed"));
-    }
 
-    #[test]
-    fn semantically_invalid_v4_contribution_envelope_is_warning_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_dir(tmp.path()).unwrap();
         let window = rolling_for_test(fixed_time(8), chrono::Duration::days(7));

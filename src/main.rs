@@ -1430,7 +1430,7 @@ mod tests {
 
     #[cfg(feature = "github")]
     #[test]
-    fn shared_github_login_is_resolved_once_for_me_and_exclude() {
+    fn identity_resolution_deduplicates_shared_logins_and_bounds_sorted_requests() {
         let me = filter::parse_me_expr("github:OctoCat").unwrap();
         let rules = exclude::ExcludeRule::parse_many(":author:github:octocat").unwrap();
         let requested = collect_requested_github_logins(Some(&me), &rules);
@@ -1447,11 +1447,7 @@ mod tests {
             resolution.email_to_login_map(),
             HashMap::from([("octocat@example.com".to_string(), "octocat".to_string())])
         );
-    }
 
-    #[cfg(feature = "github")]
-    #[test]
-    fn identity_resolution_limits_sorted_logins_and_emits_one_combined_warning() {
         let requested = (0..10)
             .rev()
             .map(|index| format!("user-{index:02}"))
@@ -1477,7 +1473,7 @@ mod tests {
 
     #[cfg(feature = "github")]
     #[test]
-    fn remote_identity_map_continues_after_an_unresolved_origin() {
+    fn remote_identity_map_continues_after_misses_and_keeps_first_conflict() {
         let repos = vec![
             analyze::RepoInput {
                 path: PathBuf::from("one"),
@@ -1526,11 +1522,7 @@ mod tests {
             HashMap::from([("alice@example.com".to_string(), "octocat".to_string())])
         );
         assert!(report.warnings.is_empty());
-    }
 
-    #[cfg(feature = "github")]
-    #[test]
-    fn remote_identity_map_keeps_first_success_and_warns_once_on_conflict() {
         let repos = vec![
             analyze::RepoInput {
                 path: PathBuf::from("one"),
@@ -1573,39 +1565,27 @@ mod tests {
     }
 
     #[test]
-    fn reversed_date_range_is_rejected_before_analysis() {
+    fn time_validation_and_duration_rounding_cover_edge_cases() {
         let error = resolve_time_range(None, Some("2025-02-02"), Some("2025-02-01"), fixed_now())
             .unwrap_err();
-
         assert!(
             error
                 .to_string()
                 .contains("--since must not be after --until")
         );
-    }
 
-    #[test]
-    fn date_only_until_becomes_exclusive_next_midnight() {
         let range = resolve_time_range(None, None, Some("2025-02-01"), fixed_now()).unwrap();
-
         assert_eq!(
             range.until_exclusive,
             Some(Utc.with_ymd_and_hms(2025, 2, 2, 0, 0, 0).single().unwrap())
         );
-    }
 
-    #[test]
-    fn invalid_days_are_rejected() {
         for days in [-1.0, 0.0, f64::NAN, f64::INFINITY, f64::MAX] {
             assert!(
                 resolve_time_range(Some(days), None, None, fixed_now()).is_err(),
                 "expected {days:?} to be rejected"
             );
         }
-    }
-
-    #[test]
-    fn positive_fractional_days_round_up_to_one_second() {
         assert_eq!(
             duration_for_days(0.000_001, "--days")
                 .unwrap()

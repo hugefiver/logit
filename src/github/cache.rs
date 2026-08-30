@@ -92,17 +92,14 @@ mod tests {
     use std::{ffi::OsString, fs, path::PathBuf};
 
     #[test]
-    fn github_cache_dir_override_is_exact_and_not_extended() {
+    fn github_cache_dir_selection_prefers_exact_override_and_preserves_fallback() {
         let expected = PathBuf::from("C:/runner-temp/logit-github-cache");
         let actual = dirs_or_fallback_with(|name| {
             (name == "LOGIT_GITHUB_CACHE_DIR").then(|| expected.clone().into_os_string())
         });
 
         assert_eq!(actual, expected);
-    }
 
-    #[test]
-    fn github_cache_defaults_remain_platform_compatible_without_override() {
         let actual = dirs_or_fallback_with(|name| match name {
             "LOCALAPPDATA" => Some(PathBuf::from("C:/Local").into_os_string()),
             _ => None,

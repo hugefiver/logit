@@ -18,44 +18,33 @@ fn run_stats_json(paths: &[&std::path::Path], selectors: &[&str]) -> std::proces
 
 #[cfg(feature = "github")]
 #[test]
-fn github_multi_rejects_out_of_range_period_before_token_check() {
-    let output = Command::cargo_bin("logit")
-        .expect("locate logit binary")
-        .args(["github", "multi", "octocat", "--periods", "1000000000d"])
-        .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("run logit github multi");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn github_preflight_rejects_invalid_periods_and_future_dates_before_token_check() {
+    let cases = [
+        (
+            ["github", "multi", "octocat", "--periods", "1000000000d"],
+            ["1000000000d", "range", "too large"],
+        ),
+        (
+            ["github", "fetch", "octocat", "--since", "2999-01-01"],
+            ["--since", "future", "future"],
+        ),
+    ];
 
-    assert!(
-        !output.status.success(),
-        "logit github multi unexpectedly succeeded\nstderr: {stderr}"
-    );
-    assert!(stderr.contains("1000000000d"), "stderr: {stderr}");
-    assert!(
-        stderr.contains("range") && stderr.contains("too large"),
-        "stderr: {stderr}"
-    );
-    assert!(!stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
-}
+    for (args, expected) in cases {
+        let output = Command::cargo_bin("logit")
+            .expect("locate logit binary")
+            .args(args)
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .expect("run invalid GitHub command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-#[cfg(feature = "github")]
-#[test]
-fn github_future_since_is_rejected_before_token_or_network() {
-    let output = Command::cargo_bin("logit")
-        .expect("locate logit binary")
-        .args(["github", "fetch", "octocat", "--since", "2999-01-01"])
-        .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("run logit github fetch");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success(), "stderr: {stderr}");
-    assert!(
-        stderr.contains("--since") && stderr.contains("future"),
-        "stderr: {stderr}"
-    );
-    assert!(!stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
+        assert!(!output.status.success(), "args: {args:?}\nstderr: {stderr}");
+        for message in expected {
+            assert!(stderr.contains(message), "args: {args:?}\nstderr: {stderr}");
+        }
+        assert!(!stderr.contains("GITHUB_TOKEN"), "stderr: {stderr}");
+    }
 }
 
 #[cfg(feature = "github")]
@@ -388,7 +377,7 @@ fn cli_me_github_noreply_matches_without_token_or_network() {
 }
 
 #[test]
-fn cli_filter_empty_diagnostic_is_not_no_commits_diagnostic() {
+fn cli_filter_diagnostics_distinguish_empty_and_partial_matches() {
     let tmp = TempDir::new().unwrap();
     let _repo = common::create_test_repo(tmp.path());
 
@@ -414,10 +403,7 @@ fn cli_filter_empty_diagnostic_is_not_no_commits_diagnostic() {
         !stderr.contains("No commits found in the given period."),
         "stderr: {stderr}"
     );
-}
 
-#[test]
-fn cli_partial_committer_filter_reports_matching_filters_for_skipped_repositories() {
     let tmp = TempDir::new().unwrap();
     let matching_path = tmp.path().join("matching");
     let skipped_path = tmp.path().join("skipped");

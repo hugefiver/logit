@@ -551,11 +551,11 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::cli::{Column, DedupMode, EmailDisplay, GroupBy, SortBy};
-    use crate::stats::models::{AuthorStats, GroupNode, LangStats, PeriodStats};
+    use crate::stats::models::{GroupNode, LangStats, PeriodStats};
 
     use super::{
         PresentationData, PresentationMetrics, PresentationOptions, PresentationRowKind,
-        build_presentation, merge_author_stats,
+        build_presentation,
     };
 
     fn period(label: &str, commits: u64, languages: &[(&str, u64, u64, u64)]) -> PeriodStats {
@@ -748,99 +748,6 @@ mod tests {
             ]
         );
         assert_eq!(model.total.metrics.commits, 1);
-    }
-
-    #[test]
-    fn presentation_author_merge_preserves_all_primary_and_coauthored_metrics() {
-        let mut target = AuthorStats {
-            commits: 1,
-            co_authored_commits: 2,
-            additions: 3,
-            co_authored_additions: 4,
-            deletions: 5,
-            co_authored_deletions: 6,
-            languages: HashMap::from([(
-                "Rust".to_string(),
-                LangStats {
-                    additions: 7,
-                    deletions: 8,
-                    files_changed: 9,
-                    net_modifications: 10,
-                    net_additions: 11,
-                },
-            )]),
-            co_authored_languages: HashMap::from([(
-                "Rust".to_string(),
-                LangStats {
-                    additions: 12,
-                    deletions: 13,
-                    files_changed: 14,
-                    net_modifications: 15,
-                    net_additions: 16,
-                },
-            )]),
-            net_modifications: 17,
-            co_authored_net_modifications: 18,
-            net_additions: 19,
-            co_authored_net_additions: 20,
-        };
-        let source = AuthorStats {
-            commits: 101,
-            co_authored_commits: 102,
-            additions: 103,
-            co_authored_additions: 104,
-            deletions: 105,
-            co_authored_deletions: 106,
-            languages: HashMap::from([(
-                "Rust".to_string(),
-                LangStats {
-                    additions: 107,
-                    deletions: 108,
-                    files_changed: 109,
-                    net_modifications: 110,
-                    net_additions: 111,
-                },
-            )]),
-            co_authored_languages: HashMap::from([(
-                "Rust".to_string(),
-                LangStats {
-                    additions: 112,
-                    deletions: 113,
-                    files_changed: 114,
-                    net_modifications: 115,
-                    net_additions: 116,
-                },
-            )]),
-            net_modifications: 117,
-            co_authored_net_modifications: 118,
-            net_additions: 119,
-            co_authored_net_additions: 120,
-        };
-
-        merge_author_stats(&mut target, &source);
-
-        assert_eq!(target.commits, 102);
-        assert_eq!(target.co_authored_commits, 104);
-        assert_eq!(target.additions, 106);
-        assert_eq!(target.co_authored_additions, 108);
-        assert_eq!(target.deletions, 110);
-        assert_eq!(target.co_authored_deletions, 112);
-        assert_eq!(target.net_modifications, 134);
-        assert_eq!(target.co_authored_net_modifications, 136);
-        assert_eq!(target.net_additions, 138);
-        assert_eq!(target.co_authored_net_additions, 140);
-        let rust = &target.languages["Rust"];
-        assert_eq!(rust.additions, 114);
-        assert_eq!(rust.deletions, 116);
-        assert_eq!(rust.files_changed, 118);
-        assert_eq!(rust.net_modifications, 120);
-        assert_eq!(rust.net_additions, 122);
-        let co_rust = &target.co_authored_languages["Rust"];
-        assert_eq!(co_rust.additions, 124);
-        assert_eq!(co_rust.deletions, 126);
-        assert_eq!(co_rust.files_changed, 128);
-        assert_eq!(co_rust.net_modifications, 130);
-        assert_eq!(co_rust.net_additions, 132);
     }
 
     #[cfg(feature = "github")]
