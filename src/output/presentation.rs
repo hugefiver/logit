@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::cli::{Column, DedupMode, EmailDisplay, GroupBy, SortBy};
+use crate::git::author::canonical_email_key;
 use crate::stats::models::{AuthorStats, GroupNode, LangStats, PeriodStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,7 +465,7 @@ fn author_merge_key(
         DedupMode::Name => name.to_string(),
         #[cfg(feature = "github")]
         DedupMode::Remote => email
-            .and_then(|email| identity_map.get(&email.to_ascii_lowercase()))
+            .and_then(|email| identity_map.get(&canonical_email_key(email)))
             .cloned()
             .unwrap_or_else(|| label.to_string()),
     }
@@ -840,6 +841,22 @@ mod tests {
         assert_eq!(co_rust.files_changed, 128);
         assert_eq!(co_rust.net_modifications, 130);
         assert_eq!(co_rust.net_additions, 132);
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn remote_author_dedup_canonicalizes_email_before_identity_lookup() {
+        let identity_map =
+            HashMap::from([("octocat@example.com".to_string(), "octocat".to_string())]);
+
+        assert_eq!(
+            super::author_merge_key(
+                "Octocat < OctoCat@Example.COM >",
+                &DedupMode::Remote,
+                &identity_map,
+            ),
+            "octocat"
+        );
     }
 
     #[cfg(feature = "github")]

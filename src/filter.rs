@@ -238,22 +238,30 @@ impl MeAtom {
     }
 }
 
+/// Match GitHub's exact local noreply email forms for a login.
+pub(crate) fn github_noreply_matches(email: &str, login: &str) -> bool {
+    // {id}+{username}@users.noreply.github.com or
+    // {username}@users.noreply.github.com
+    let email_lower = canonical_email_key(email);
+    if email_lower.ends_with("@users.noreply.github.com") {
+        let local = email_lower.split('@').next().unwrap_or("");
+        let extracted = local.split_once('+').map(|(_, u)| u).unwrap_or(local);
+        return extracted == login.trim().to_ascii_lowercase();
+    }
+    false
+}
+
 fn is_github_match(
     email: &str,
     username_lower: &str,
     identity_map: &HashMap<String, String>,
 ) -> bool {
-    // 1. Check noreply pattern locally: {id}+{username}@users.noreply.github.com
-    //    or {username}@users.noreply.github.com
-    let email_lower = canonical_email_key(email);
-    if email_lower.ends_with("@users.noreply.github.com") {
-        let local = email_lower.split('@').next().unwrap_or("");
-        let extracted = local.split_once('+').map(|(_, u)| u).unwrap_or(local);
-        if extracted == username_lower {
-            return true;
-        }
+    // 1. Check local noreply email before consulting resolved identities.
+    if github_noreply_matches(email, username_lower) {
+        return true;
     }
     // 2. Check identity map (canonical email → canonical GitHub login).
+    let email_lower = canonical_email_key(email);
     if let Some(login) = identity_map.get(&email_lower)
         && login.eq_ignore_ascii_case(username_lower)
     {
@@ -385,6 +393,18 @@ mod tests {
         let expr = parse_me_expr("github:hugefiver").unwrap();
         let commit = make_commit("Hugefiver", "18693500+hugefiver@users.noreply.github.com");
         assert!(expr.matches_commit(&commit, &HashMap::new()));
+    }
+
+    #[test]
+    fn github_noreply_match_canonicalizes_email_and_login() {
+        assert!(github_noreply_matches(
+            " 18693500+OctoCat@users.noreply.github.com ",
+            " OCTOCAT "
+        ));
+        assert!(!github_noreply_matches(
+            "octocat@notusers.noreply.github.com",
+            "octocat"
+        ));
     }
 
     #[test]

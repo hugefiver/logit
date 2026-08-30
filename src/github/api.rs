@@ -189,7 +189,7 @@ fn retry_after_wait(headers: &HeaderMap, now: DateTime<Utc>) -> Option<std::time
     let retry_at = DateTime::parse_from_rfc2822(value)
         .ok()?
         .with_timezone(&Utc);
-    let seconds = retry_at.timestamp().saturating_sub(now.timestamp()) as u64;
+    let seconds = retry_at.timestamp().saturating_sub(now.timestamp()).max(0) as u64;
     Some(std::time::Duration::from_secs(seconds))
 }
 
@@ -2880,6 +2880,24 @@ mod tests {
         );
 
         assert_eq!(decision, RetryDecision::RetryAfter(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn retry_decision_past_retry_after_http_date_retries_immediately() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let decision = retry_decision(
+                status,
+                &response_headers(&[("retry-after", "Tue, 31 Dec 2024 23:59:59 GMT")]),
+                Duration::from_secs(1),
+                fixed_time(1),
+                Duration::from_secs(120),
+            );
+
+            assert_eq!(decision, RetryDecision::RetryAfter(Duration::ZERO));
+        }
     }
 
     #[test]

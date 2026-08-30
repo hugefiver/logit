@@ -129,7 +129,7 @@ fn repo_id_for_path(path: &Path) -> String {
 pub fn platform_repo_key(value: &str, windows: bool) -> String {
     let normalized = value.replace('\\', "/");
     if windows {
-        normalized.to_ascii_lowercase()
+        normalized.to_lowercase()
     } else {
         normalized
     }
@@ -465,6 +465,9 @@ mod tests {
         assert_eq!(platform_repo_key(r"Team\Service", false), "Team/Service");
         assert!(platform_repo_eq("Team/Service", "team/service", true));
         assert!(!platform_repo_eq("Team/Service", "team/service", false));
+        assert_eq!(platform_repo_key(r"TÉAM\RÉSUMÉ", true), "téam/résumé");
+        assert!(platform_repo_eq("TÉAM/RÉSUMÉ", "téam/résumé", true));
+        assert!(!platform_repo_eq("TÉAM/RÉSUMÉ", "téam/résumé", false));
     }
 
     #[test]
