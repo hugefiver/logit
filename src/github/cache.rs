@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::Context;
 
@@ -63,12 +63,20 @@ impl DiskCache {
 }
 
 fn dirs_or_fallback() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+    dirs_or_fallback_with(|name| std::env::var_os(name))
+}
+
+fn dirs_or_fallback_with(get_env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    if let Some(cache_dir) = get_env("LOGIT_GITHUB_CACHE_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(cache_dir);
+    }
+
+    if let Some(local) = get_env("LOCALAPPDATA") {
         PathBuf::from(local)
             .join("logit")
             .join("cache")
             .join("github")
-    } else if let Ok(home) = std::env::var("HOME") {
+    } else if let Some(home) = get_env("HOME") {
         PathBuf::from(home)
             .join(".cache")
             .join("logit")
@@ -80,8 +88,36 @@ fn dirs_or_fallback() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DiskCache;
-    use std::fs;
+    use super::{DiskCache, dirs_or_fallback_with};
+    use std::{ffi::OsString, fs, path::PathBuf};
+
+    #[test]
+    fn github_cache_dir_override_is_exact_and_not_extended() {
+        let expected = PathBuf::from("C:/runner-temp/logit-github-cache");
+        let actual = dirs_or_fallback_with(|name| {
+            (name == "LOGIT_GITHUB_CACHE_DIR").then(|| expected.clone().into_os_string())
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn github_cache_defaults_remain_platform_compatible_without_override() {
+        let actual = dirs_or_fallback_with(|name| match name {
+            "LOCALAPPDATA" => Some(PathBuf::from("C:/Local").into_os_string()),
+            _ => None,
+        });
+
+        assert_eq!(actual, PathBuf::from("C:/Local/logit/cache/github"));
+
+        let actual = dirs_or_fallback_with(|name| match name {
+            "LOGIT_GITHUB_CACHE_DIR" => Some(OsString::new()),
+            "LOCALAPPDATA" => Some(PathBuf::from("C:/Local").into_os_string()),
+            _ => None,
+        });
+
+        assert_eq!(actual, PathBuf::from("C:/Local/logit/cache/github"));
+    }
 
     #[test]
     fn cache_set_get_roundtrip() {

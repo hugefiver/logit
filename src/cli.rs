@@ -550,8 +550,32 @@ pub struct GithubMultiArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use clap::CommandFactory;
+
+    fn long_options(command: &clap::Command) -> BTreeMap<String, Option<char>> {
+        command
+            .get_arguments()
+            .filter_map(|arg| {
+                arg.get_long()
+                    .map(|long| (long.to_owned(), arg.get_short()))
+            })
+            .collect()
+    }
+
+    fn assert_option_surface(command: &clap::Command, expected: &[(&str, Option<char>)]) {
+        assert_eq!(
+            long_options(command),
+            expected
+                .iter()
+                .map(|(long, short)| ((*long).to_owned(), *short))
+                .collect(),
+            "{} option surface changed",
+            command.get_name()
+        );
+    }
 
     #[test]
     fn verify_cli() {
@@ -566,6 +590,141 @@ mod tests {
 
         assert!(help.contains("fallback"), "help: {help}");
         assert!(help.contains("subgroup"), "help: {help}");
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn cli_public_option_and_short_alias_surface_is_exact() {
+        let mut command = Cli::command();
+        let scan = command.find_subcommand_mut("scan").expect("scan command");
+        assert_option_surface(scan, &[("format", Some('f')), ("output", Some('o'))]);
+
+        let stats = command.find_subcommand_mut("stats").expect("stats command");
+        assert_option_surface(
+            stats,
+            &[
+                ("author", None),
+                ("columns", None),
+                ("committer", None),
+                ("compact", None),
+                ("days", Some('d')),
+                ("dedup", None),
+                ("exclude", None),
+                ("exclude-columns", None),
+                ("exclude-lang", None),
+                ("format", Some('f')),
+                ("group", None),
+                ("groups", None),
+                ("inline-tree", None),
+                ("lang", None),
+                ("me", None),
+                ("no-compact", None),
+                ("number-format", None),
+                ("output", Some('o')),
+                ("period", None),
+                ("repo", None),
+                ("short", None),
+                ("show-email", None),
+                ("since", None),
+                ("sort", None),
+                ("until", None),
+            ],
+        );
+        assert!(
+            stats
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some("compact"))
+                .expect("stats compact option")
+                .is_hide_set()
+        );
+
+        let github = command
+            .find_subcommand_mut("github")
+            .expect("github command");
+        let fetch = github
+            .find_subcommand_mut("fetch")
+            .expect("github fetch command");
+        assert_option_surface(
+            fetch,
+            &[
+                ("columns", None),
+                ("compact", None),
+                ("days", Some('d')),
+                ("exclude", None),
+                ("exclude-columns", None),
+                ("exclude-lang", None),
+                ("format", Some('f')),
+                ("group", None),
+                ("groups", None),
+                ("include-contributed", None),
+                ("include-forks", None),
+                ("include-private", None),
+                ("inline-tree", None),
+                ("no-cache", None),
+                ("no-compact", None),
+                ("number-format", None),
+                ("output", Some('o')),
+                ("period", None),
+                ("refresh-cache", None),
+                ("short", None),
+                ("since", None),
+                ("sort", None),
+                ("until", None),
+            ],
+        );
+        assert!(
+            fetch
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some("compact"))
+                .expect("fetch compact option")
+                .is_hide_set()
+        );
+
+        let card = github
+            .find_subcommand_mut("card")
+            .expect("github card command");
+        assert_option_surface(
+            card,
+            &[
+                ("days", Some('d')),
+                ("exclude", None),
+                ("exclude-lang", None),
+                ("include-contributed", None),
+                ("include-forks", None),
+                ("include-private", None),
+                ("input", Some('i')),
+                ("lang-rows", None),
+                ("no-cache", None),
+                ("number-format", None),
+                ("number-format-lines", None),
+                ("output", Some('o')),
+                ("refresh-cache", None),
+                ("short", None),
+                ("since", None),
+                ("title", None),
+                ("until", None),
+            ],
+        );
+
+        let multi = github
+            .find_subcommand_mut("multi")
+            .expect("github multi command");
+        assert_option_surface(
+            multi,
+            &[
+                ("exclude", None),
+                ("exclude-lang", None),
+                ("include-contributed", None),
+                ("include-forks", None),
+                ("include-private", None),
+                ("no-cache", None),
+                ("number-format", None),
+                ("number-format-lines", None),
+                ("output", Some('o')),
+                ("periods", Some('p')),
+                ("refresh-cache", None),
+            ],
+        );
     }
 
     #[cfg(feature = "github")]

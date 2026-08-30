@@ -90,6 +90,77 @@ fn successful_stats_json(paths: &[&std::path::Path], selectors: &[&str]) -> Valu
     serde_json::from_slice(&output.stdout).expect("stats JSON output")
 }
 
+fn assert_numeric_lang_stats(stats: &Value) {
+    for field in [
+        "additions",
+        "deletions",
+        "files_changed",
+        "net_modifications",
+        "net_additions",
+    ] {
+        assert!(stats[field].is_u64(), "{field} was not numeric: {stats}");
+    }
+}
+
+fn assert_numeric_author_stats(stats: &Value) {
+    for field in [
+        "commits",
+        "co_authored_commits",
+        "additions",
+        "co_authored_additions",
+        "deletions",
+        "co_authored_deletions",
+        "net_modifications",
+        "co_authored_net_modifications",
+        "net_additions",
+        "co_authored_net_additions",
+    ] {
+        assert!(stats[field].is_u64(), "{field} was not numeric: {stats}");
+    }
+    for languages in ["languages", "co_authored_languages"] {
+        for language in stats[languages]
+            .as_object()
+            .expect("author language breakdown")
+            .values()
+        {
+            assert_numeric_lang_stats(language);
+        }
+    }
+}
+
+fn assert_flat_stats_json_contract(json: &Value) {
+    let periods = json["periods"].as_array().expect("flat periods array");
+    assert!(!periods.is_empty(), "flat periods must not be empty");
+    let totals = &json["totals"];
+
+    for stats in periods.iter().chain(std::iter::once(totals)) {
+        assert!(stats["period_label"].is_string(), "period label: {stats}");
+        for field in [
+            "total_commits",
+            "total_additions",
+            "total_deletions",
+            "total_net_modifications",
+            "total_net_additions",
+        ] {
+            assert!(stats[field].is_u64(), "{field} was not numeric: {stats}");
+        }
+        for language in stats["by_language"]
+            .as_object()
+            .expect("language breakdown")
+            .values()
+        {
+            assert_numeric_lang_stats(language);
+        }
+        for author in stats["by_author"]
+            .as_object()
+            .expect("author breakdown")
+            .values()
+        {
+            assert_numeric_author_stats(author);
+        }
+    }
+}
+
 fn append_commit_with_committer(repo: &git2::Repository, committer_name: &str) {
     let parent = repo
         .head()
@@ -669,6 +740,80 @@ fn cli_group_and_groups_historical_semantics() {
             "stderr: {stderr}"
         );
     }
+}
+
+#[test]
+fn cli_help_json_and_group_compatibility_contract_remains_intact() {
+    let help = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args(["stats", "--help"])
+        .output()
+        .expect("render stats help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("UTF-8 stats help");
+    for option in [
+        "--author",
+        "--committer",
+        "--since",
+        "--until",
+        "--exclude",
+        "--repo",
+        "--group",
+        "--groups",
+        "--days",
+        "--me",
+        "--dedup",
+    ] {
+        assert!(
+            help.contains(option),
+            "missing {option} from stats help: {help}"
+        );
+    }
+
+    let tmp = TempDir::new().expect("temporary fixture directory");
+    let _repo = common::create_test_repo(tmp.path());
+    let output = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args([
+            "stats",
+            tmp.path().to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "json",
+            "--group",
+            "repo,author,language",
+        ])
+        .output()
+        .expect("run flat JSON stats");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_flat_stats_json_contract(
+        &serde_json::from_slice(&output.stdout).expect("flat JSON output"),
+    );
+
+    let grouped = Command::cargo_bin("logit")
+        .expect("locate logit binary")
+        .args([
+            "stats",
+            tmp.path().to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "json",
+            "--group",
+            "repo,author,language",
+            "--groups",
+            "author,period",
+        ])
+        .output()
+        .expect("run grouped JSON stats");
+    assert!(
+        grouped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&grouped.stderr)
+    );
+    let grouped: Value = serde_json::from_slice(&grouped.stdout).expect("grouped JSON output");
+    assert!(grouped.is_array(), "grouped JSON: {grouped}");
 }
 
 #[test]

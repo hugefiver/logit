@@ -31,16 +31,78 @@ fn action_source() -> String {
         .expect("read action.yml")
 }
 
-fn generate_svg_step(source: &str) -> &str {
+fn ci_source() -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".github")
+            .join("workflows")
+            .join("ci.yml"),
+    )
+    .expect("read CI workflow")
+}
+
+fn declared_input_names(source: &str) -> Vec<String> {
+    let inputs = source
+        .strip_prefix("name: 'Logit GitHub Card'\n")
+        .and_then(|source| source.split_once("inputs:\n"))
+        .expect("inputs block")
+        .1
+        .split_once("outputs:\n")
+        .expect("outputs block")
+        .0;
+
+    inputs
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  ")
+                .and_then(|line| line.strip_suffix(':'))
+                .filter(|name| !name.contains(' '))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn declared_output_names(source: &str) -> Vec<String> {
+    let outputs = source
+        .split_once("outputs:\n")
+        .expect("outputs block")
+        .1
+        .split_once("runs:\n")
+        .expect("runs block")
+        .0;
+
+    outputs
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  ")
+                .and_then(|line| line.strip_suffix(':'))
+                .filter(|name| !name.contains(' '))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn data_cache_key_line(source: &str) -> &str {
+    source
+        .lines()
+        .find(|line| line.trim_start().starts_with("key: logit-data-"))
+        .expect("GitHub data cache key")
+}
+
+fn named_step<'a>(source: &'a str, name: &str) -> &'a str {
     let start = source
-        .find("    - name: Generate SVG\n")
-        .expect("Generate SVG step");
+        .find(&format!("    - name: {name}\n"))
+        .expect("named action step");
     let step = &source[start..];
     let end = step.find("\n    - ").unwrap_or(step.len());
     &step[..end]
 }
 
-fn generate_svg_run_block(step: &str) -> String {
+fn generate_svg_step(source: &str) -> &str {
+    named_step(source, "Generate SVG")
+}
+
+fn step_run_block(step: &str) -> String {
     let marker = "      run: |\n";
     let start = step.find(marker).expect("Generate SVG run block") + marker.len();
     let mut run_block = String::new();
@@ -69,11 +131,12 @@ fn input_env_mappings(step: &str) -> HashMap<String, String> {
             break;
         };
         let (name, expression) = line.split_once(": ").expect("env mapping");
-        let input = expression
+        if let Some(input) = expression
             .strip_prefix("${{ inputs.")
             .and_then(|expression| expression.strip_suffix(" }}"))
-            .expect("input expression in Generate SVG env block");
-        mappings.insert(input.to_owned(), name.to_owned());
+        {
+            mappings.insert(input.to_owned(), name.to_owned());
+        }
     }
 
     mappings
@@ -162,11 +225,7 @@ fn run_action(
     let script_path = temp.path().join("run-action.sh");
     fs::write(
         &script_path,
-        format!(
-            "{}\n{}",
-            environment.join("\n"),
-            generate_svg_run_block(step)
-        ),
+        format!("{}\n{}", environment.join("\n"), step_run_block(step)),
     )
     .expect("write action test script");
 
@@ -197,10 +256,119 @@ fn logged_argv(argv_log: &Path) -> Vec<String> {
 }
 
 #[test]
+fn ci_has_exact_locked_ubuntu_quality_and_windows_test_contract() {
+    let source = ci_source();
+
+    for command in [
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --all-targets --all-features -- -D warnings",
+        "cargo check --locked --no-default-features",
+        "cargo build --locked --release --all-features",
+    ] {
+        assert_eq!(source.matches(command).count(), 1, "command: {command}");
+    }
+    assert_eq!(
+        source.matches("cargo test --locked --all-features").count(),
+        2
+    );
+    assert!(source.contains("runs-on: ubuntu-latest"));
+    assert!(source.contains("runs-on: windows-latest"));
+    assert!(source.contains("components: rustfmt, clippy"));
+    assert!(!source.to_ascii_lowercase().contains("macos"));
+    assert!(!source.to_ascii_lowercase().contains("msrv"));
+}
+
+#[test]
+fn action_public_input_and_output_names_are_exactly_preserved() {
+    let source = action_source();
+
+    assert_eq!(
+        declared_input_names(&source),
+        INPUT_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(declared_output_names(&source), ["svg-path"]);
+}
+
+#[test]
+fn action_preserves_inputs_output_and_uses_one_cross_platform_cache_directory() {
+    let source = action_source();
+    assert_eq!(
+        declared_input_names(&source),
+        INPUT_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+    assert!(source.contains("outputs:\n  svg-path:"));
+
+    let cache_dir = "${{ runner.temp }}/logit-github-cache";
+    assert_eq!(source.matches(&format!("path: {cache_dir}")).count(), 1);
+    assert_eq!(
+        source
+            .matches(&format!("LOGIT_GITHUB_CACHE_DIR: {cache_dir}"))
+            .count(),
+        1
+    );
+    assert!(source.contains("logit-data-v4-${{ runner.os }}-${{ steps.datakey.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}"));
+    assert!(source.contains("logit-data-v4-${{ runner.os }}-${{ steps.datakey.outputs.hash }}-"));
+    assert!(!data_cache_key_line(&source).contains("inputs.username"));
+
+    let data_key_step = named_step(&source, "Compute GitHub data cache key");
+    let data_inputs = [
+        "username",
+        "command",
+        "days",
+        "periods",
+        "include-forks",
+        "include-contributed",
+        "include-private",
+    ];
+    let mappings = input_env_mappings(data_key_step);
+    assert_eq!(mappings.len(), data_inputs.len());
+    for input in data_inputs {
+        assert!(
+            mappings.contains_key(input),
+            "missing data input mapping for {input}"
+        );
+    }
+    let run_block = step_run_block(data_key_step);
+    assert!(!run_block.contains("${{ inputs."));
+    assert!(run_block.contains("printf '%s\\0'"));
+    assert!(run_block.contains("sha256sum"));
+}
+
+#[test]
+fn action_adds_refresh_once_for_card_and_multi_and_installs_locked() {
+    if !find_bash() {
+        return;
+    }
+
+    let source = action_source();
+    assert!(source.contains("cargo install --locked --path"));
+    for command_name in ["card", "multi"] {
+        let temp = TempDir::new().unwrap();
+        let mut inputs = valid_inputs();
+        inputs.insert("command".into(), command_name.into());
+        let (output, argv_log, _) = run_action(&inputs, &temp, &[0]);
+        assert!(output.status.success());
+        let argv = logged_argv(&argv_log);
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| arg.as_str() == "--refresh-cache")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn action_run_block_has_no_expression_interpolation_eval_or_xargs() {
     let source = action_source();
     let step = generate_svg_step(&source);
-    let run_block = generate_svg_run_block(step);
+    let run_block = step_run_block(step);
 
     assert!(!run_block.contains("${{ inputs."));
     assert!(!run_block.contains("eval"));
@@ -243,6 +411,7 @@ fn action_stub_preserves_literal_argv_and_final_status_when_bash_exists() {
         "github",
         "card",
         "octocat",
+        "--refresh-cache",
         "-d",
         "365",
         "--short",

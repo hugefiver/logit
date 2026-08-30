@@ -91,6 +91,17 @@ logit stats --exclude "my-repo:lang:md,p:*.md"
 logit stats --exclude :lang:json --exclude :path:**/*.lock
 ```
 
+#### GitHub identity filters and remote deduplication
+
+`--me github:<login>` and `--exclude @<login>` match that login's known public
+commit emails as well as its local GitHub noreply address. Email matching is
+case-insensitive. Identity-provider lookups are bounded; if a provider lookup
+fails or returns only partial data, logit writes a partial-warning to stderr and
+may miss unknown commit emails.
+
+`--dedup remote` checks each selected repository's GitHub `origin`
+independently, then merges identities that resolve to the same GitHub login.
+
 ### GitHub statistics
 
 Requires a `GITHUB_TOKEN` environment variable (PAT with `read:user` scope).
@@ -113,6 +124,13 @@ logit github card <username> --short --days 90
 logit github multi <username> -p week,month,year
 ```
 
+#### GitHub cache behavior
+
+GitHub commands use the disk cache in ReadOnly mode by default. `--refresh-cache`
+reads cached data, fetches incremental updates, and writes the result back.
+`--no-cache` performs zero cache I/O and overrides `--refresh-cache` when both
+are supplied.
+
 ### Output formats
 
 ```sh
@@ -125,6 +143,9 @@ logit stats -f tui
 logit stats -o stats.txt
 logit github card <username> -o card.svg
 ```
+
+Warnings are written only to stderr; successful JSON output on stdout keeps its
+existing shape and field types.
 
 ## GitHub Action
 
@@ -178,6 +199,11 @@ jobs:
 | `output` | `profile-card.svg` | Output path |
 | `retry-count` | `3` | Retries after the initial attempt |
 | `retry-delay` | `5` | Seconds between retries |
+
+The Action keeps its GitHub data cache at
+`${{ runner.temp }}/logit-github-cache` and automatically passes one
+`--refresh-cache` per card or multi invocation. Its 16 input names and its
+`svg-path` output remain stable.
 
 ## License
 

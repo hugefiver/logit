@@ -87,19 +87,38 @@ runs:
         restore-keys: |
           logit-${{ runner.os }}-
 
+    - name: Compute GitHub data cache key
+      id: datakey
+      shell: bash
+      env:
+        INPUT_USERNAME: ${{ inputs.username }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_DAYS: ${{ inputs.days }}
+        INPUT_PERIODS: ${{ inputs.periods }}
+        INPUT_INCLUDE_FORKS: ${{ inputs.include-forks }}
+        INPUT_INCLUDE_CONTRIBUTED: ${{ inputs.include-contributed }}
+        INPUT_INCLUDE_PRIVATE: ${{ inputs.include-private }}
+      run: |
+        set -euo pipefail
+        HASH=$(printf '%s\0' "$INPUT_USERNAME" "$INPUT_COMMAND" "$INPUT_DAYS" "$INPUT_PERIODS" "$INPUT_INCLUDE_FORKS" "$INPUT_INCLUDE_CONTRIBUTED" "$INPUT_INCLUDE_PRIVATE" | sha256sum | cut -d' ' -f1)
+        echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
     - uses: actions/cache@v6
       with:
-        path: ~/.cache/logit/github/
-        key: logit-data-${{ inputs.username }}-${{ inputs.command }}-${{ inputs.days }}
+        path: ${{ runner.temp }}/logit-github-cache
+        key: logit-data-v4-${{ runner.os }}-${{ steps.datakey.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          logit-data-v4-${{ runner.os }}-${{ steps.datakey.outputs.hash }}-
 
     - name: Install logit
       if: steps.cache-logit.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install --path "${{ github.action_path }}" --features github --force
+      run: cargo install --locked --path "${{ github.action_path }}" --features github --force
 
     - name: Generate SVG
       shell: bash
       env:
+        LOGIT_GITHUB_CACHE_DIR: ${{ runner.temp }}/logit-github-cache
         INPUT_USERNAME: ${{ inputs.username }}
         GITHUB_TOKEN: ${{ inputs.token }}
         INPUT_COMMAND: ${{ inputs.command }}
@@ -165,7 +184,7 @@ runs:
           done
         fi
 
-        cmd=(logit github "$INPUT_COMMAND" "$INPUT_USERNAME")
+        cmd=(logit github "$INPUT_COMMAND" "$INPUT_USERNAME" --refresh-cache)
         if [ "$INPUT_COMMAND" = "multi" ]; then
           cmd+=(-p "$INPUT_PERIODS")
         else
